@@ -23,9 +23,6 @@ import qualified Data.Set         as Set
 -- deepseq
 import           Control.DeepSeq
 
--- -- data-fix
--- import           Data.Fix
-
 -- directory
 import           System.Directory
 
@@ -41,10 +38,10 @@ import           GHC.Generics
 
 -- | A directory tree node. Everything is either a file, a symbolic link, or a
 -- directory.
-data DirTreeNode s a r
-  = Symlink s
+data DirTreeNode r s a
+  = Directory r
+  | Symlink s
   | File a
-  | Directory r
   deriving (Show, Eq, Ord, Functor, Foldable, Traversable, NFData, Generic)
 
 -- | A DirTreeNode is a weird kind of algebra.
@@ -56,33 +53,36 @@ flattenDirTreeNode = \case
 
 -- | We can map over a DirTreeNode
 mapDirTreeNode ::
-  (s -> s') -> (a -> a') -> (r -> r')
-  -> DirTreeNode s a r
-  -> DirTreeNode s' a' r'
-mapDirTreeNode fs fa fr = \case
+  (r -> r') -> (s -> s') -> (a -> a')
+  -> DirTreeNode r s a
+  -> DirTreeNode r' s' a'
+mapDirTreeNode fr fs fa = \case
   File a -> File $ fa a
   Symlink s -> Symlink $ fs s
   Directory r -> Directory $ fr r
 
 -- | We can fold over a DirTreeNode by providing a function for each case.
-foldDirTreeNode :: (s -> m) -> (a -> m) -> (r -> m) -> DirTreeNode s a r -> m
-foldDirTreeNode fs fa fr =
-  flattenDirTreeNode . mapDirTreeNode fs fa fr
+foldDirTreeNode :: (r -> m) -> (s -> m) -> (a -> m) -> DirTreeNode r s a -> m
+foldDirTreeNode fr fs fa =
+  flattenDirTreeNode . mapDirTreeNode fr fs fa
 
 -- | We can fold over a DirTreeNode by providing a function for each case.
 traverseDirTreeNode ::
   Functor m
-  => (s -> m s') -> (a -> m a') -> (r -> m r')
-  -> DirTreeNode s a r -> m (DirTreeNode s' a' r')
-traverseDirTreeNode fs fa fr =
+  =>
+  (r -> m r') -> (s -> m s') -> (a -> m a')
+  -> DirTreeNode r s a -> m (DirTreeNode r' s' a')
+traverseDirTreeNode fr fs fa =
   flattenDirTreeNode . mapDirTreeNode
+    (fmap Directory . fr)
     (fmap Symlink . fs)
     (fmap File . fa)
-    (fmap Directory . fr)
 
-type DirTreeN s a = DirTreeNode s a [(String, DirTree s a)]
+type DirTreeNode' r = DirTreeNode [(String, r)]
 
-newtype DirTree s a = DirTree (DirTreeNode s a [(String, DirTree s a)])
+type DirTreeN s a = DirTreeNode' (DirTree s a) s a
+
+newtype DirTree s a = DirTree (DirTreeN s a)
   deriving (Show, Eq, Ord, NFData, Generic)
 
 -- | Get the underlying dirTreeNode
@@ -127,7 +127,7 @@ instance Functor (DirTree s) where
 mapDirTree :: (s -> s') -> (a -> a') -> DirTree s a -> DirTree s' a'
 mapDirTree fs fa =
     DirTree
-    . mapDirTreeNode fs fa (map.fmap.mapDirTree fs $ fa)
+    . mapDirTreeNode (map.fmap.mapDirTree fs $ fa) fs fa
     . dirTreeNode
 
 instance Foldable (DirTree s) where
@@ -136,7 +136,7 @@ instance Foldable (DirTree s) where
 -- | Folds over a dirtree
 foldDirTree :: ([(String, m)] -> m) -> (s -> m) -> (a -> m) -> DirTree s a -> m
 foldDirTree fr fs fa =
-  foldDirTreeNode fs fa (fr . fmap (fmap (foldDirTree fr fs fa)))
+  foldDirTreeNode (fr . fmap (fmap (foldDirTree fr fs fa))) fs fa
   . dirTreeNode
 
 instance Traversable (DirTree s) where
@@ -148,7 +148,7 @@ traverseDirTree ::
   -> DirTree s a -> m (DirTree s' a')
 traverseDirTree fs fa =
   fmap DirTree
-  . traverseDirTreeNode fs fa (traverse.traverse.traverseDirTree fs $ fa)
+  . traverseDirTreeNode (traverse.traverse.traverseDirTree fs $ fa) fs fa
   . dirTreeNode
 
 -- | Check a filepath for Type, throws an IOException if path does not exist.
@@ -167,13 +167,13 @@ checkPath fp =
 -- | Reads the structure of the filepath
 readDirTreeNode ::
   FilePath
-  -> IO (DirTreeNode FilePath () [String])
+  -> IO (DirTreeNode [String] FilePath ())
 readDirTreeNode fp = do
   node <- checkPath fp
   foldDirTreeNode
+    (const $ Directory <$> listDirectory fp)
     (const $ Symlink <$> getSymbolicLinkTarget fp)
     (const . return $ File ())
-    (const $ Directory <$> listDirectory fp)
     node
 
 -- | Reads a DirTree
@@ -183,9 +183,9 @@ readDirTree ::
 readDirTree fp = do
   node <- readDirTreeNode fp
   foldDirTreeNode
+    (fmap directory . mapM (\s -> (s,) <$> readDirTree (fp </> s)))
     (return . symlink . (\case a | isAbsolute a -> a | otherwise -> takeDirectory fp </> a))
     (const . return $ file fp)
-    (fmap directory . mapM (\s -> (s,) <$> readDirTree (fp </> s)))
     node
 
 -- | Flatten a directory tree. This is usefull for following symlinks, or
@@ -215,6 +215,7 @@ followLinksLimit n =
   . traverseDirTree
     (followLinksLimit (n - 1) <=< readDirTree)
     pure
+
 
 data Anchored a = (:/)
   { base    ::  FilePath
