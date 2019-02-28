@@ -13,6 +13,7 @@ License     : MIT
 Maintainer  : kalhauge@cs.ucla.edu
 
 A directory tree, with helper functions to do different cool stuff.
+
 -}
 module System.DirTree where
 
@@ -36,6 +37,124 @@ import           Data.Void
 import           Control.Monad
 import           GHC.Generics
 
+-- * DirTree
+
+newtype DirTree s a = DirTree (DirTreeN s a)
+  deriving (Show, Eq, Ord, NFData, Generic)
+
+type DirTreeNode' r = DirTreeNode [(String, r)]
+
+type DirTreeN s a = DirTreeNode' (DirTree s a) s a
+
+instance Semigroup (DirTree s a) where
+  DirTree (Directory as) <> DirTree (Directory bs) =
+    DirTree (Directory (reverse . nubWith (<>) . reverse $ as <> bs))
+  _ <> a = a
+
+instance Functor (DirTree s) where
+  fmap = mapDirTree id
+
+instance Foldable (DirTree s) where
+  foldMap = foldDirTree (foldMap snd) (const mempty)
+
+instance Traversable (DirTree s) where
+  traverse = traverseDirTree pure
+
+-- | Get the underlying dirTreeNode
+dirTreeNode :: DirTree s a -> DirTreeN s a
+dirTreeNode (DirTree a) = a
+
+-- ** Constructors
+
+-- | Constructs a dirtree with only a file
+file :: a -> DirTree s a
+file = DirTree . File
+
+-- | Constructs a dirtree with a symlink
+symlink :: s -> DirTree s a
+symlink = DirTree . Symlink
+
+-- | Constructs a dirtree with a directory
+directory :: [(String, DirTree s a)] -> DirTree s a
+directory = DirTree . Directory
+
+-- ** Helpers
+
+-- | Maps over a dir tree
+mapDirTree :: (s -> s') -> (a -> a') -> DirTree s a -> DirTree s' a'
+mapDirTree fs fa =
+    DirTree
+    . mapDirTreeNode (map.fmap.mapDirTree fs $ fa) fs fa
+    . dirTreeNode
+
+-- | Folds over a dirtree
+foldDirTree :: ([(String, m)] -> m) -> (s -> m) -> (a -> m) -> DirTree s a -> m
+foldDirTree fr fs fa =
+  foldDirTreeNode (fr . fmap (fmap (foldDirTree fr fs fa))) fs fa
+  . dirTreeNode
+
+-- | Traverse a DirTree
+traverseDirTree ::
+  Applicative m
+  => (s -> m s') -> (a -> m a')
+  -> DirTree s a -> m (DirTree s' a')
+traverseDirTree fs fa =
+  fmap DirTree
+  . traverseDirTreeNode (traverse.traverse.traverseDirTree fs $ fa) fs fa
+  . dirTreeNode
+
+-- | Flatten a directory tree. This is usefull for following symlinks, or
+-- expanding zip-files.
+flatten ::
+  (s -> DirTree s' a')
+  -> (a -> DirTree s' a')
+  -> DirTree s a
+  -> DirTree s' a'
+flatten =
+  foldDirTree directory
+
+-- ** IO Methods
+
+-- | Reads a DirTree
+readDirTree ::
+  FilePath
+  -> IO (DirTree FilePath FilePath)
+readDirTree fp = do
+  node <- readPath fp
+  foldDirTreeNode
+    (fmap directory . mapM (\s -> (s,) <$> readDirTree (fp </> s)))
+    (return . symlink . (\case a | isAbsolute a -> a | otherwise -> takeDirectory fp </> a))
+    (const . return $ file fp)
+    node
+
+-- -- | Reads a DirTree
+-- writeDirTreeWith ::
+--   (FilePath -> a -> IO ())
+--   -> FilePath
+--   -> DirTree FilePath a
+--   -> IO ()
+-- writeDirTreeWith ffile fp =
+
+-- | Follow the links to create the tree. This function might recurse forever.
+followLinks :: DirTree FilePath FilePath -> IO (DirTree Void FilePath)
+followLinks =
+  fmap (flatten id file)
+  . traverseDirTree
+    (followLinks <=< readDirTree)
+    pure
+
+-- | Follow the links to create the tree. The first argument is max depth.
+-- Give a negative number to possible recurse forever.
+followLinksLimit :: Int -> DirTree FilePath FilePath -> IO (DirTree FilePath FilePath)
+followLinksLimit 0 = pure
+followLinksLimit n =
+  fmap (flatten id file)
+  . traverseDirTree
+    (followLinksLimit (n - 1) <=< readDirTree)
+    pure
+
+-- * DirTreeNode
+
 -- | A directory tree node. Everything is either a file, a symbolic link, or a
 -- directory.
 data DirTreeNode r s a
@@ -43,6 +162,8 @@ data DirTreeNode r s a
   | Symlink s
   | File a
   deriving (Show, Eq, Ord, Functor, Foldable, Traversable, NFData, Generic)
+
+-- ** Helpers
 
 -- | A DirTreeNode is a weird kind of algebra.
 flattenDirTreeNode :: DirTreeNode m m m -> m
@@ -78,28 +199,51 @@ traverseDirTreeNode fr fs fa =
     (fmap Symlink . fs)
     (fmap File . fa)
 
-type DirTreeNode' r = DirTreeNode [(String, r)]
+-- ** IO Methods
 
-type DirTreeN s a = DirTreeNode' (DirTree s a) s a
+-- | Check a filepath for Type, throws an IOException if path does not exist.
+checkPath :: FilePath -> IO (DirTreeNode () () ())
+checkPath fp =
+  pathIsSymbolicLink fp >>= \case
+  True ->
+    return $ Symlink ()
+  False ->
+    doesDirectoryExist fp >>= \case
+    True ->
+      return $ Directory ()
+    False ->
+      return $ File ()
 
-newtype DirTree s a = DirTree (DirTreeN s a)
-  deriving (Show, Eq, Ord, NFData, Generic)
+-- | Reads the structure of the filepath
+readPath ::
+  FilePath
+  -> IO (DirTreeNode [String] FilePath ())
+readPath fp = do
+  node <- checkPath fp
+  foldDirTreeNode
+    (const $ Directory <$> listDirectory fp)
+    (const $ Symlink <$> getSymbolicLinkTarget fp)
+    (const . return $ File ())
+    node
 
--- | Get the underlying dirTreeNode
-dirTreeNode :: DirTree s a -> DirTreeN s a
-dirTreeNode (DirTree a) = a
+-- | Reads the structure of the filepath
+writePathWith ::
+  (a -> IO ())
+  -> (r -> IO ())
+  -> FilePath
+  -> (DirTreeNode r FilePath a)
+  -> IO ()
+writePathWith ffile ffolder fp node = do
+  foldDirTreeNode
+    (\r -> do
+        createDirectory fp
+        ffolder r
+     )
+    (\t -> createFileLink t fp)
+    (ffile)
+    node
 
--- | Constructs a dirtree with only a file
-file :: a -> DirTree s a
-file = DirTree . File
-
--- | Constructs a dirtree with a symlink
-symlink :: s -> DirTree s a
-symlink = DirTree . Symlink
-
--- | Constructs a dirtree with a directory
-directory :: [(String, DirTree s a)] -> DirTree s a
-directory = DirTree . Directory
+-- * Utils
 
 nubSet :: Ord a => [a] -> [a]
 nubSet = go Set.empty
@@ -116,282 +260,8 @@ nubWith fmerge m = do
   return (key, mergedvalues Map.! key)
   where mergedvalues = Map.fromListWith (fmerge) m
 
-instance Semigroup (DirTree s a) where
-  DirTree (Directory as) <> DirTree (Directory bs) =
-    DirTree (Directory (reverse . nubWith (<>) . reverse $ as <> bs))
-  _ <> a = a
-
-instance Functor (DirTree s) where
-  fmap = mapDirTree id
-
-mapDirTree :: (s -> s') -> (a -> a') -> DirTree s a -> DirTree s' a'
-mapDirTree fs fa =
-    DirTree
-    . mapDirTreeNode (map.fmap.mapDirTree fs $ fa) fs fa
-    . dirTreeNode
-
-instance Foldable (DirTree s) where
-  foldMap = foldDirTree (foldMap snd) (const mempty)
-
--- | Folds over a dirtree
-foldDirTree :: ([(String, m)] -> m) -> (s -> m) -> (a -> m) -> DirTree s a -> m
-foldDirTree fr fs fa =
-  foldDirTreeNode (fr . fmap (fmap (foldDirTree fr fs fa))) fs fa
-  . dirTreeNode
-
-instance Traversable (DirTree s) where
-  traverse = traverseDirTree pure
-
-traverseDirTree ::
-  Applicative m
-  => (s -> m s') -> (a -> m a')
-  -> DirTree s a -> m (DirTree s' a')
-traverseDirTree fs fa =
-  fmap DirTree
-  . traverseDirTreeNode (traverse.traverse.traverseDirTree fs $ fa) fs fa
-  . dirTreeNode
-
--- | Check a filepath for Type, throws an IOException if path does not exist.
-checkPath :: FilePath -> IO (DirTreeNode () () ())
-checkPath fp =
-  pathIsSymbolicLink fp >>= \case
-  True ->
-    return $ Symlink ()
-  False ->
-    doesDirectoryExist fp >>= \case
-    True ->
-      return $ Directory ()
-    False ->
-      return $ File ()
-
--- | Reads the structure of the filepath
-readDirTreeNode ::
-  FilePath
-  -> IO (DirTreeNode [String] FilePath ())
-readDirTreeNode fp = do
-  node <- checkPath fp
-  foldDirTreeNode
-    (const $ Directory <$> listDirectory fp)
-    (const $ Symlink <$> getSymbolicLinkTarget fp)
-    (const . return $ File ())
-    node
-
--- | Reads a DirTree
-readDirTree ::
-  FilePath
-  -> IO (DirTree FilePath FilePath)
-readDirTree fp = do
-  node <- readDirTreeNode fp
-  foldDirTreeNode
-    (fmap directory . mapM (\s -> (s,) <$> readDirTree (fp </> s)))
-    (return . symlink . (\case a | isAbsolute a -> a | otherwise -> takeDirectory fp </> a))
-    (const . return $ file fp)
-    node
-
--- | Flatten a directory tree. This is usefull for following symlinks, or
--- expanding zip-files.
-flatten ::
-  (s -> DirTree s' a')
-  -> (a -> DirTree s' a')
-  -> DirTree s a
-  -> DirTree s' a'
-flatten =
-  foldDirTree directory
-
--- | Follow the links to create the tree. This function might recurse forever.
-followLinks :: DirTree FilePath FilePath -> IO (DirTree Void FilePath)
-followLinks =
-  fmap (flatten id file)
-  . traverseDirTree
-    (followLinks <=< readDirTree)
-    pure
-
--- | Follow the links to create the tree. The first argument is max depth.
--- Give a negative number to possible recurse forever.
-followLinksLimit :: Int -> DirTree FilePath FilePath -> IO (DirTree FilePath FilePath)
-followLinksLimit 0 = pure
-followLinksLimit n =
-  fmap (flatten id file)
-  . traverseDirTree
-    (followLinksLimit (n - 1) <=< readDirTree)
-    pure
-
-
 data Anchored a = (:/)
   { base    ::  FilePath
   , dirTree :: a
   } deriving (Show, Eq, Ord, Functor, Foldable, Traversable, NFData, Generic)
 
-
--- read :: FilePath -> IO (Anchored (DirTree FilePath))
--- read fp = do
-  -- tree <- DirTree <$> anaM go fp
-  -- return $ fp :/ tree
-  -- where
-  --   go fp' = do
-  --     files <- listDirectory fp'
-  --     DirTreeF . Map.fromList <$> mapM (readDir fp') files
-
-  --   readDir :: FilePath -> FilePath -> IO (FilePath, DirTreeNode FilePath FilePath)
-  --   readDir fp' f = do
-  --     let f' = fp' </> f
-  --     x <- doesDirectoryExist f'
-  --     return . (f,) $ if x
-  --       then Dir f'
-  --       else File f'
-
-
--- -- | A directory tree node.
--- data DirTreeNode a r
---   = File !a
---   | Dir !r
---   deriving (Show, Eq, Ord, Functor, Foldable, Traversable, NFData, Generic)
-
--- foldDirTreeNode :: (a -> b) -> (r -> b) -> DirTreeNode a r -> b
--- foldDirTreeNode ff fd =
---   \case
---     File a -> ff a
---     Dir  r -> fd r
-
-
--- newtype DirTreeF a r =
---   DirTreeF { unDirTreeF :: Map.Map FilePath (DirTreeNode a r) }
---   deriving (Show, Eq, Ord, Functor, Foldable, Traversable, NFData, Generic)
-
--- type DirTree' a = Fix (DirTreeF a)
-
--- -- | A directory tree
--- newtype DirTree a =
---   DirTree {unDirTree :: Fix (DirTreeF a)}
---   deriving (Show, Eq, Ord, Generic)
-
--- -- | A directory tree
--- newtype DirNode a =
---   DirNode { unDirNode :: DirTreeNode a (DirTree a) }
---   deriving (Show, Eq, Ord, Generic)
-
--- instance Functor DirTree where
---   fmap f =
---     DirTree . cata (Fix . DirTreeF . Map.map node . unDirTreeF) . unDirTree
---     where
---       node = \case
---         File a -> File (f a)
---         Dir b -> Dir b
-
--- instance Foldable DirTree where
---   foldMap f =
---     cata (foldMap (foldDirTreeNode f id) . unDirTreeF) . unDirTree
-
--- instance Traversable DirTree where
---   traverse f (DirTree m) = DirTree <$> cata go m
---     where
---       go (DirTreeF m') = Fix . DirTreeF <$> traverse help m'
---       help = foldDirTreeNode (fmap File . f) (fmap Dir)
-
--- -- | An Right biased semi group
--- instance Semigroup (DirTree a) where
---   (<>) (DirTree a') (DirTree b') =
---     DirTree $ go (a', b')
---     where
---       go (Fix (DirTreeF a), Fix (DirTreeF b)) =
---         Fix . DirTreeF $ Map.unionWith (curry unioner) a b
---       unioner = \case
---         (Dir a, Dir b) -> Dir $ go (a, b)
---         (_, a) -> a
-
--- data AnchoredTree a = (:/)
---   { anchor  :: ! FilePath
---   , dirTree :: ! (DirTree a)
---   } deriving (Show, Eq, Functor, Foldable, Traversable, Generic)
-
-
--- filterTree :: (DirTreeNode (String, a) String -> Bool) -> DirTree a -> DirTree a
--- filterTree fn (DirTree dtree) =
---   DirTree $ go dtree
---   where
---       go (Fix (DirTreeF a)) =
---         Fix . DirTreeF $
---           Map.filterWithKey
---           (\key -> fn . foldDirTreeNode (File .(key,)) (Dir . (const key)))
---           a
-
--- filterTreeOnFiles :: (FilePath -> Bool) -> DirTree a -> DirTree a
--- filterTreeOnFiles fn =
---   fromJust . fromFileList . filter (fn . fst) . toFileList
-
--- foldTreeWithFilePath ::
---   Monoid m
---   => (FilePath -> a -> m)
---   -> (FilePath -> m)
---   -> DirTree a
---   -> m
--- foldTreeWithFilePath f d (DirTree tree) =
---   go id tree
---   where
---     go fpm tree'  =
---       flip Map.foldMapWithKey (unDirTreeF . unFix $ tree') $ \fp -> \case
---         File a -> f (fpm fp) a
---         Dir r -> d (fpm fp) <> go (fpm fp </>) r
-
--- toFileList :: DirTree a -> [(FilePath, a)]
--- toFileList tree =
---   let x = foldTreeWithFilePath (\fp a -> Endo ((fp, a):)) (const mempty) tree
---   in appEndo x []
-
--- fromFileList :: [(FilePath, a)] -> Maybe (DirTree a)
--- fromFileList lst =
---   fmap DirTree . group $ map (\(fp, a) -> (splitDirectories fp, a)) lst
---   where
---     group :: [([String], a)] -> Maybe (DirTree' a)
---     group grp =
---       case partitionEithers $ map unwind grp of
---         ([], rest) ->
---           Fix . DirTreeF <$> traverse casx (Map.fromListWith (++) rest)
---         _ ->
---           Nothing
-
---     casx [([], a)] = Just $ File a
---     casx res = Dir <$> group res
-
---     unwind (x, a) =
---       maybe (Left a) (\(f,rest) -> Right (f, [(rest, a)])) $ List.uncons x
-
--- readTree :: FilePath -> IO (AnchoredTree FilePath)
--- readTree fp = do
---   tree <- DirTree <$> anaM go fp
---   return $ fp :/ tree
---   where
---     go fp' = do
---       files <- listDirectory fp'
---       DirTreeF . Map.fromList <$> mapM (readDir fp') files
-
---     readDir :: FilePath -> FilePath -> IO (FilePath, DirTreeNode FilePath FilePath)
---     readDir fp' f = do
---       let f' = fp' </> f
---       x <- doesDirectoryExist f'
---       return . (f,) $ if x
---         then Dir f'
---         else File f'
-
--- writeTreeWith :: (FilePath -> a -> IO ()) -> AnchoredTree a -> IO ()
--- writeTreeWith f (fp :/ tree) = do
---   createDirectoryIfMissing True fp
---   foldTreeWithFilePath handleFile handleDirectory  tree
-
---   where
---     handleFile f' a = do
---       f (fp </> f' ) a
---     handleDirectory f' = do
---       createDirectory (fp </> f')
-
--- data FileContent
---   = Content BL.ByteString
---   | SameAs FilePath
---   deriving (Show, Eq)
-
--- writeContent :: FilePath -> FileContent -> IO ()
--- writeContent fp = \case
---   Content bs ->
---     BL.writeFile fp bs
---   SameAs old ->
---     createFileLink old fp

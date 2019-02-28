@@ -20,25 +20,25 @@ spec = do
     it "should throw an IOException if nothing is found" $ do
       checkPath "test/data/nothing" `shouldThrow` anyException
 
-  describe "readDirTreeNode" $ do
+  describe "readPath" $ do
     it "should find a directory" $ do
-      readDirTreeNode "test/data" `shouldReturn`
+      readPath "test/data" `shouldReturn`
         Directory ["symlink", "file", "folderlink", "folder", "abslink"]
 
     it "should find a file" $ do
-      readDirTreeNode "test/data/file" `shouldReturn`
+      readPath "test/data/file" `shouldReturn`
         File ()
 
     it "should find a symbolic link" $ do
-      readDirTreeNode "test/data/symlink" `shouldReturn`
+      readPath "test/data/symlink" `shouldReturn`
         Symlink "file"
 
     it "should find a symbolic to a folder" $ do
-      readDirTreeNode "test/data/folderlink" `shouldReturn`
+      readPath "test/data/folderlink" `shouldReturn`
         Symlink "folder"
 
     it "should throw an IOException if nothing exists" $ do
-      readDirTreeNode "test/data/nothing" `shouldThrow` anyException
+      readPath "test/data/nothing" `shouldThrow` anyException
 
   describe "readDirTree" $ do
     it "should read the data directory" $ do
