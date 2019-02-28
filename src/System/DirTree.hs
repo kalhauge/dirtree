@@ -15,17 +15,75 @@ Maintainer  : kalhauge@cs.ucla.edu
 A directory tree, with helper functions to do different cool stuff.
 
 -}
-module System.DirTree where
+module System.DirTree
+ (
+
+ -- * DirTree
+   DirTree (..)
+
+ , file
+ , symlink
+ , directory
+
+ -- ** Folds
+ -- These function are used for folding over the DirTree
+
+ , mapDirTree
+ , traverseDirTree
+ , flatten
+
+ , foldDirTree
+
+ -- ** Utils
+
+ , depthfirst
+ , findFile
+ , listFiles
+ , forgetOrder
+
+
+ -- ** IO operations
+ -- These functions can be used to read a DirTree from the file system.
+ , readDirTree
+ , lazyReadDirTree
+
+ , writeDirTree
+
+ , readFiles
+
+ , followLinks
+ , followLinksLimit
+
+
+ -- * DirTreeNode
+ , DirTreeNode (..)
+ , FileType
+ , fileTypeOfNode
+
+ -- ** Folds
+ , mapDirTreeNode
+ , foldDirTreeNode
+
+ -- ** IO operations
+ , getFileType
+ , readPath
+ , writePathWith
+
+ -- * Helpers
+ , DirTreeN
+ , FileMap
+ ) where
 
 -- containers
-import qualified Data.Map         as Map
-import qualified Data.Set         as Set
+import qualified Data.Map          as Map
+import qualified Data.Set          as Set
+import qualified Data.List         as List
 
 -- deepseq
 import           Control.DeepSeq
 
 -- directory
-import           System.Directory
+import           System.Directory  hiding (findFile)
 
 -- filepath
 import           System.FilePath
@@ -33,18 +91,29 @@ import           System.FilePath
 -- void
 import           Data.Void
 
+-- mtl
+import           Control.Monad.Reader
+
+
 -- base
-import           Control.Monad
+import           Data.Foldable
+import           Data.Semigroup
 import           GHC.Generics
+import           System.IO.Unsafe
 
 -- * DirTree
 
-newtype DirTree s a = DirTree (DirTreeN s a)
+-- | A dir tree is a tree of nodes.
+newtype DirTree s a = DirTree
+  { dirTreeNode :: DirTreeN s a
+  }
   deriving (Show, Eq, Ord, NFData, Generic)
 
-type DirTreeNode' r = DirTreeNode [(String, r)]
+-- | A `DirTreeN` is a `DirTreeNode` with a the directory as a recursive
+-- DirTree.
+type DirTreeN s a = DirTreeNode (FileMap (DirTree s a)) s a
 
-type DirTreeN s a = DirTreeNode' (DirTree s a) s a
+type FileMap a = [(String, a)]
 
 instance Semigroup (DirTree s a) where
   DirTree (Directory as) <> DirTree (Directory bs) =
@@ -55,14 +124,10 @@ instance Functor (DirTree s) where
   fmap = mapDirTree id
 
 instance Foldable (DirTree s) where
-  foldMap = foldDirTree (foldMap snd) (const mempty)
+  foldMap f = foldDirTree (foldDirTreeNode (foldMap snd) (const mempty) f)
 
 instance Traversable (DirTree s) where
   traverse = traverseDirTree pure
-
--- | Get the underlying dirTreeNode
-dirTreeNode :: DirTree s a -> DirTreeN s a
-dirTreeNode (DirTree a) = a
 
 -- ** Constructors
 
@@ -87,12 +152,6 @@ mapDirTree fs fa =
     . mapDirTreeNode (map.fmap.mapDirTree fs $ fa) fs fa
     . dirTreeNode
 
--- | Folds over a dirtree
-foldDirTree :: ([(String, m)] -> m) -> (s -> m) -> (a -> m) -> DirTree s a -> m
-foldDirTree fr fs fa =
-  foldDirTreeNode (fr . fmap (fmap (foldDirTree fr fs fa))) fs fa
-  . dirTreeNode
-
 -- | Traverse a DirTree
 traverseDirTree ::
   Applicative m
@@ -103,6 +162,11 @@ traverseDirTree fs fa =
   . traverseDirTreeNode (traverse.traverse.traverseDirTree fs $ fa) fs fa
   . dirTreeNode
 
+-- | Folds over a dirtree
+foldDirTree :: (DirTreeNode (FileMap m) s a -> m) -> DirTree s a -> m
+foldDirTree f =
+  f . mapDirTreeNode (fmap . fmap $ foldDirTree f) id id . dirTreeNode
+
 -- | Flatten a directory tree. This is usefull for following symlinks, or
 -- expanding zip-files.
 flatten ::
@@ -110,22 +174,50 @@ flatten ::
   -> (a -> DirTree s' a')
   -> DirTree s a
   -> DirTree s' a'
-flatten =
-  foldDirTree directory
+flatten s a =
+  foldDirTree (foldDirTreeNode directory s a)
 
--- ** IO Methods
+-- * Utils
 
--- | Reads a DirTree
-readDirTree ::
-  FilePath
-  -> IO (DirTree FilePath FilePath)
-readDirTree fp = do
-  node <- readPath fp
-  foldDirTreeNode
-    (fmap directory . mapM (\s -> (s,) <$> readDirTree (fp </> s)))
-    (return . symlink . (\case a | isAbsolute a -> a | otherwise -> takeDirectory fp </> a))
-    (const . return $ file fp)
-    node
+-- | Recursively iterate over a folder.
+depthfirst :: Monoid m => FilePath -> (FilePath -> DirTreeNode [String] v a -> m) -> DirTree v a -> m
+depthfirst basefile fm =
+  flip runReader basefile . foldDirTree
+  (\file' -> do
+      fp <- ask
+      case file' of
+        Directory files -> do
+          let x = fm fp (Directory (map fst files))
+          rest <- mapM (\(s, a) -> local (</> s) a) files
+          return (x <> fold rest)
+        File a  ->
+          return $ fm fp (File a)
+        Symlink v  ->
+          return $ fm fp (Symlink v)
+  )
+
+findFile ::
+  (FilePath -> DirTreeNode [String] v a -> Bool)
+  -> DirTree v a
+  -> Maybe (FilePath, DirTreeNode [String] v a)
+findFile f =
+  fmap getFirst . depthfirst "."
+  (curry $ \case
+      a | uncurry f a -> Just (First a)
+        | otherwise -> Nothing
+  )
+
+listFiles :: DirTree v a -> [(FilePath, DirTreeNode [String] v a)]
+listFiles =
+  flip appEndo [] . depthfirst "." (curry $ Endo . (:))
+
+forgetOrder :: DirTree v a -> DirTree v a
+forgetOrder =
+  DirTree
+  . mapDirTreeNode
+  (map (\(s, a) -> (s, forgetOrder a))
+   . List.sortOn fst) id id
+  . dirTreeNode
 
 -- -- | Reads a DirTree
 -- writeDirTreeWith ::
@@ -135,10 +227,46 @@ readDirTree fp = do
 --   -> IO ()
 -- writeDirTreeWith ffile fp =
 
+
+
+-- ** IO Methods
+
+-- | Reads a DirTree
+readDirTree ::
+  FilePath
+  -> IO (DirTree FilePath FilePath)
+readDirTree fp =
+  force <$> lazyReadDirTree fp
+
+-- | Lazy read a DirTree. This function uses `unsafeInterleaveIO` to
+-- lazy interleave load a node. This means that it can be used to efficiently
+-- search of a file.
+lazyReadDirTree ::
+  FilePath
+  -> IO (DirTree FilePath FilePath)
+lazyReadDirTree fp = unsafeInterleaveIO $ do
+  node <- readPath fp
+  foldDirTreeNode
+    (fmap directory . mapM (\s -> (s,) <$> lazyReadDirTree (fp </> s)))
+    (return . symlink . (
+        \case
+          a | isAbsolute a -> a
+            | otherwise -> takeDirectory fp </> a
+    ))
+    (const . return $ file fp)
+    node
+
 -- | Follow the links to create the tree. This function might recurse forever.
 followLinks :: DirTree FilePath FilePath -> IO (DirTree Void FilePath)
-followLinks =
-  fmap (flatten id file)
+followLinks dt =
+  force <$> lazyFollowLinks dt
+
+-- | Like follow links but uses lazy io to only load the recursive folder when
+-- needed.
+lazyFollowLinks :: DirTree FilePath FilePath -> IO (DirTree Void FilePath)
+lazyFollowLinks =
+  unsafeInterleaveIO
+  . fmap (flatten id file)
   . traverseDirTree
     (followLinks <=< readDirTree)
     pure
@@ -153,6 +281,25 @@ followLinksLimit n =
     (followLinksLimit (n - 1) <=< readDirTree)
     pure
 
+-- | Read all the files in the `DirTree`. This is just a specialiezed
+-- `traverse`
+readFiles :: (FilePath -> IO a) -> DirTree v FilePath -> IO (DirTree v a)
+readFiles = traverse
+{-# INLINE readFiles #-}
+
+-- | Write a `DirTree` to the folder
+writeDirTree :: (FilePath -> a -> IO ()) -> FilePath -> DirTree FilePath a -> IO ()
+writeDirTree writeFileF fp =
+  depthfirst fp (\f -> \case
+    Directory _ -> do
+      createDirectory f
+    Symlink target
+      | isAbsolute target -> createFileLink target f
+      | otherwise -> createFileLink (makeRelative fp target) f
+    File a ->
+      writeFileF f a
+  )
+
 -- * DirTreeNode
 
 -- | A directory tree node. Everything is either a file, a symbolic link, or a
@@ -162,6 +309,9 @@ data DirTreeNode r s a
   | Symlink s
   | File a
   deriving (Show, Eq, Ord, Functor, Foldable, Traversable, NFData, Generic)
+
+
+type FileType = DirTreeNode () () ()
 
 -- ** Helpers
 
@@ -199,11 +349,15 @@ traverseDirTreeNode fr fs fa =
     (fmap Symlink . fs)
     (fmap File . fa)
 
+
+fileTypeOfNode :: DirTreeNode a b c -> FileType
+fileTypeOfNode = mapDirTreeNode (const ()) (const ()) (const ())
+
 -- ** IO Methods
 
 -- | Check a filepath for Type, throws an IOException if path does not exist.
-checkPath :: FilePath -> IO (DirTreeNode () () ())
-checkPath fp =
+getFileType :: FilePath -> IO FileType
+getFileType fp =
   pathIsSymbolicLink fp >>= \case
   True ->
     return $ Symlink ()
@@ -219,7 +373,7 @@ readPath ::
   FilePath
   -> IO (DirTreeNode [String] FilePath ())
 readPath fp = do
-  node <- checkPath fp
+  node <- getFileType fp
   foldDirTreeNode
     (const $ Directory <$> listDirectory fp)
     (const $ Symlink <$> getSymbolicLinkTarget fp)

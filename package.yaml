@@ -20,6 +20,7 @@ dependencies:
   - containers
   - deepseq
   - filepath
+  - mtl
 
 library:
     source-dirs: src

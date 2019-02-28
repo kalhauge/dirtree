@@ -1,24 +1,29 @@
 module System.DirTreeSpec where
 
-import Test.Hspec (Spec, describe, it)
+import Test.Hspec (Spec, describe, it, before)
 import Test.Hspec.Expectations.Pretty
 
 import System.DirTree
 
+import System.FilePath
+import System.Directory hiding (findFile)
+
+import System.IO.Error
+
 spec :: Spec
 spec = do
-  describe "checkPath" $ do
+  describe "getFileType" $ do
     it "should find a directory" $ do
-      checkPath "test/data" `shouldReturn` Directory ()
+      getFileType "test/data" `shouldReturn` Directory ()
 
     it "should find a file" $ do
-      checkPath "test/data/file" `shouldReturn` File ()
+      getFileType "test/data/file" `shouldReturn` File ()
 
     it "should find a symbolic link" $ do
-      checkPath "test/data/symlink" `shouldReturn` Symlink ()
+      getFileType "test/data/symlink" `shouldReturn` Symlink ()
 
     it "should throw an IOException if nothing is found" $ do
-      checkPath "test/data/nothing" `shouldThrow` anyException
+      getFileType "test/data/nothing" `shouldThrow` anyException
 
   describe "readPath" $ do
     it "should find a directory" $ do
@@ -55,7 +60,7 @@ spec = do
                  ])
 
   describe "followLinks" $ do
-    it "should read the follow the links in the data directory" $ do
+    it "should read and follow the links in the data directory" $ do
       (readDirTree "test/data" >>= followLinks)
         `shouldReturn`
           DirTree (Directory
@@ -67,3 +72,46 @@ spec = do
                        (Directory [("deepfile", DirTree (File "test/data/folder/deepfile"))]))
                    , ("abslink", DirTree (File "/dev/null"))
                    ])
+
+  describe "listFiles" $ do
+    it "should read the data directory" $ do
+      x <- listFiles <$> readDirTree "test/data"
+      map fst x `shouldBe`
+        [ "."
+        , "./symlink"
+        , "./file"
+        , "./folderlink"
+        , "./folder"
+        , "./folder/deepfile"
+        , "./abslink"
+        ]
+
+  describe "findFile" $ do
+    it "can find deepfile" $ do
+      x <- findFile (\fp _ -> takeBaseName fp == "deepfile") <$> readDirTree "test/data"
+      fmap fst x `shouldBe` Just "./folder/deepfile"
+
+    it "can't find notafile" $ do
+      x <- findFile (\fp _ -> takeBaseName fp == "notafile") <$> readDirTree "test/data"
+      fmap fst x `shouldBe` Nothing
+
+  describe "findFile" $ do
+    before (do
+               _ <- tryIOError $ removeDirectoryRecursive "test/output/"
+               createDirectory "test/output"
+           ) $ do
+      it "can write a file" $ do
+        let newfile = file "Hello, World!"
+        writeDirTree writeFile "test/output/newfile" newfile
+
+        readFile "test/output/newfile" `shouldReturn` "Hello, World!"
+
+      it "can write a folder" $ do
+        let folder = directory
+              [ ("file1", file "Hello, World!" )
+              , ("file2", file "Some other file" )
+              , ("file3", symlink "test/output/folder/file2" )
+              ]
+        writeDirTree writeFile "test/output/folder" folder
+        forgetOrder <$> (readFiles readFile =<< readDirTree "test/output/folder")
+          `shouldReturn` folder
