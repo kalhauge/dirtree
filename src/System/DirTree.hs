@@ -82,13 +82,16 @@ module System.DirTree
  -- ** IO operations
  , getFileType
  , readPath
- , writePathWith
 
  -- * Helpers
  , DirTreeN
 
  -- * FileMap
  , FileMap (..)
+ , toFileList
+ , fromFileList
+ , toFileNames
+ , lookupFileMap
  ) where
 
 -- containers
@@ -115,7 +118,6 @@ import           Data.Semigroup
 import           Data.Void
 import           GHC.Generics
 import           System.IO.Unsafe
-
 -- * DirTree
 
 -- | A dir tree is a tree of nodes.
@@ -178,10 +180,12 @@ directory = DirTree . Directory . FileMap
 -- | A filekey is the filepath in reverse order
 type FileKey = [String]
 
+-- | Get a `FileKey` from a `FilePath`
 fileKeyFromPath :: FilePath -> FileKey
 fileKeyFromPath =
   reverse . splitDirectories
 
+-- | Get a `FilePath` from a `FileKey`
 fileKeyToPath :: FileKey -> FilePath
 fileKeyToPath =
   joinPath . reverse
@@ -201,7 +205,7 @@ diffFileKey f to' =
     suffix [] bs =
       (0, bs)
 
-
+-- | Lookup a file in a `DirTree` using a `FileKey`
 lookupFile :: FileKey -> DirTree v a -> Maybe (DirTree v a)
 lookupFile fk = go (reverse fk)
   where
@@ -209,6 +213,7 @@ lookupFile fk = go (reverse fk)
     go (a:rest) (DirTree (Directory x)) =
       go rest =<< lookupFileMap a x
     go _ _ = Nothing
+{-# inline lookupFile #-}
 
 -- ** Helpers
 
@@ -312,6 +317,7 @@ flatten ::
   -> DirTree s' a'
 flatten s a =
   foldDirTree (foldDirTreeNode (directory . toFileList) s a)
+{-# inline flatten #-}
 
 -- * Utils
 
@@ -330,7 +336,9 @@ depthfirst fm =
         fm key (File a)
       Symlink v  ->
         fm key (Symlink v)
+{-# inline depthfirst #-}
 
+-- | Find a file given a predicate that takes a `FileKey` and `DirTreeNode`.
 findFile ::
   (FileKey -> DirTreeNode [String] v a -> Bool)
   -> DirTree v a
@@ -341,17 +349,24 @@ findFile f =
       a | uncurry f a -> Just (First a)
         | otherwise -> Nothing
   )
+{-# inline findFile #-}
 
+-- | List all the files in the `DirTree`.
 listFiles :: DirTree v a -> [(FileKey, DirTreeNode [String] v a)]
 listFiles =
   flip appEndo [] . depthfirst (curry $ Endo . (:))
+{-# inline listFiles #-}
 
+-- | Forget the internal order of forget.
 forgetOrder :: DirTree v a -> DirTree v a
 forgetOrder =
   DirTree . mapDirTreeNode forgetFileMapOrder id id . dirTreeNode
+{-# inline forgetOrder #-}
 
 -- ** IO Methods
 
+-- | A `Link` can either be `Internal`, pointing to something in the `DirTree` or
+-- `External` pointing to an absolute `FilePath`.
 data Link
   = Internal !FileKey
   | External !FilePath
@@ -423,7 +438,6 @@ writeDirTree writer fp tree = do
     )
     tree
 
-
 -- | Follow the links to create the tree. This function might recurse forever.
 followLinks :: NFData a => (FilePath -> IO a) -> DirTree Link a -> IO (DirTree Void a)
 followLinks fio dt =
@@ -451,34 +465,6 @@ lazyFollowLinks reader' tree =
         lazyFollowLinks reader' t
 
 
--- -- | Follow the links to create the tree. The first argument is max depth.
--- -- Give a negative number to possible recurse forever.
--- followLinksLimit :: Int -> DirTree Link FilePath -> IO (DirTree Link FilePath)
--- followLinksLimit 0 = pure
--- followLinksLimit n =
---   fmap (flatten id file)
---   . traverseDirTree
---     ((followLinksLimit (n - 1) <=< readDirTree) . pathFromLink)
---     pure
-
--- -- | Read all the files in the `DirTree`. This is just a specialiezed
--- -- `traverse`
--- readFiles :: (FilePath -> IO a) -> DirTree v FilePath -> IO (DirTree v a)
--- readFiles = traverse
--- {-# INLINE readFiles #-}
-
--- -- | Write a `DirTree` to the folder
--- writeDirTree :: (FilePath -> a -> IO ()) -> FilePath -> DirTree Link a -> IO ()
--- writeDirTree writeFileF fp =
---   depthfirst fp (\f -> \case
---     Directory _ -> do
---       createDirectory f
---     Symlink (External target) -> createFileLink target f
---     Symlink (Internal _ target) -> createFileLink target f
---     File a ->
---       writeFileF f a
---   )
-
 -- * DirTreeNode
 
 -- | A directory tree node. Everything is either a file, a symbolic link, or a
@@ -489,7 +475,7 @@ data DirTreeNode r s a
   | File a
   deriving (Show, Eq, Ord, Functor, Foldable, Traversable, NFData, Generic)
 
-
+-- | A `FileType` is just a `DirTreeNode` with no contents.
 type FileType = DirTreeNode () () ()
 
 -- ** Helpers
@@ -529,6 +515,7 @@ traverseDirTreeNode fr fs fa =
     (fmap File . fa)
 
 
+-- | Gets the `FileType` of a `DirTreeNode`
 fileTypeOfNode :: DirTreeNode a b c -> FileType
 fileTypeOfNode = mapDirTreeNode (const ()) (const ()) (const ())
 
@@ -559,33 +546,24 @@ readPath fp = do
     (const . return $ File ())
     node
 
--- | Reads the structure of the filepath
-writePathWith ::
-  (a -> IO ())
-  -> (r -> IO ())
-  -> FilePath
-  -> (DirTreeNode r FilePath a)
-  -> IO ()
-writePathWith ffile ffolder fp node = do
-  foldDirTreeNode
-    (\r -> do
-        createDirectory fp
-        ffolder r
-     )
-    (\t -> createFileLink t fp)
-    (ffile)
-    node
-
+-- | A map from file names to
 newtype FileMap a =
   FileMap [(String, a)]
   deriving (Eq, Ord, NFData, Generic, Functor, Foldable, Traversable)
 
+-- | Create a list of pairs of filenames and file values.
 toFileList :: FileMap a -> [(String, a)]
 toFileList (FileMap a) = a
 
+-- | Create a `FileMap` from a list of pairs of filenames a file values.
+fromFileList :: [(String, a)] -> FileMap a
+fromFileList = FileMap
+
+-- | To a list of filenames
 toFileNames :: FileMap a -> [String]
 toFileNames = map fst . toFileList
 
+-- | Lookup a file using a filename
 lookupFileMap :: String -> FileMap a -> Maybe a
 lookupFileMap s (FileMap a) = List.lookup s a
 
