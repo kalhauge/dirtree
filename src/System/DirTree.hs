@@ -1,11 +1,12 @@
-{-# LANGUAGE DeriveAnyClass      #-}
-{-# LANGUAGE DeriveFunctor       #-}
-{-# LANGUAGE DeriveGeneric       #-}
-{-# LANGUAGE DeriveTraversable   #-}
-{-# LANGUAGE FlexibleInstances   #-}
-{-# LANGUAGE LambdaCase          #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TupleSections       #-}
+{-# LANGUAGE DeriveAnyClass        #-}
+{-# LANGUAGE DeriveFunctor         #-}
+{-# LANGUAGE DeriveGeneric         #-}
+{-# LANGUAGE DeriveTraversable     #-}
+{-# LANGUAGE FlexibleInstances     #-}
+{-# LANGUAGE LambdaCase            #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE ScopedTypeVariables   #-}
+{-# LANGUAGE TupleSections         #-}
 {-|
 Module      : System.DirTree
 Copyright   : (c) Christian Gram Kalhauge, 2019
@@ -25,22 +26,37 @@ module System.DirTree
  , symlink
  , directory
 
- -- ** Folds
+ -- ** Accessors
+ , FileKey
+ , fileKeyToPath
+ , fileKeyFromPath
+
+ , lookupFile
+
+ -- ** Traversals
  -- These function are used for folding over the DirTree
 
- , mapDirTree
+
  , traverseDirTree
- , flatten
+ , traverseDirTree'
+ , itraverseDirTree
+ , itraverseDirTree'
 
- , foldDirTree
-
- -- ** Utils
+ , mapDirTree'
+ , imapDirTree'
 
  , depthfirst
+ , foldDirTree
+ , foldDirTree'
+ , ifoldDirTree
+ , ifoldDirTree'
+
+ , flatten
+
+ -- ** Utils
  , findFile
  , listFiles
  , forgetOrder
-
 
  -- ** IO operations
  -- These functions can be used to read a DirTree from the file system.
@@ -49,13 +65,11 @@ module System.DirTree
 
  , writeDirTree
 
- , readFiles
-
  , followLinks
- , followLinksLimit
-
+ , lazyFollowLinks
 
  -- * DirTreeNode
+ , Link (..)
  , DirTreeNode (..)
  , FileType
  , fileTypeOfNode
@@ -63,6 +77,7 @@ module System.DirTree
  -- ** Folds
  , mapDirTreeNode
  , foldDirTreeNode
+ , traverseDirTreeNode
 
  -- ** IO operations
  , getFileType
@@ -71,33 +86,33 @@ module System.DirTree
 
  -- * Helpers
  , DirTreeN
- , FileMap
+
+ -- * FileMap
+ , FileMap (..)
  ) where
 
 -- containers
-import qualified Data.Map          as Map
-import qualified Data.Set          as Set
-import qualified Data.List         as List
+import qualified Data.List                as List
+import qualified Data.Map                 as Map
+import qualified Data.Set                 as Set
 
 -- deepseq
 import           Control.DeepSeq
 
 -- directory
-import           System.Directory  hiding (findFile)
+import           System.Directory         hiding (findFile)
 
 -- filepath
 import           System.FilePath
 
--- void
-import           Data.Void
-
--- mtl
-import           Control.Monad.Reader
-
+-- lens
+import           Control.Lens.Combinators
+-- import           Control.Lens.Indexed
 
 -- base
 import           Data.Foldable
 import           Data.Semigroup
+import           Data.Void
 import           GHC.Generics
 import           System.IO.Unsafe
 
@@ -107,27 +122,42 @@ import           System.IO.Unsafe
 newtype DirTree s a = DirTree
   { dirTreeNode :: DirTreeN s a
   }
-  deriving (Show, Eq, Ord, NFData, Generic)
+  deriving (Eq, Ord, NFData, Generic)
+
+instance (Show v, Show c) => Show (DirTree v c) where
+  showsPrec d c = showParen (d >9) $ (f $ dirTreeNode c)
+    where
+    f = \case
+      Directory (FileMap a) ->
+        showString "directory " . showsPrec 11 a
+      Symlink a ->
+        showString "symlink " . showsPrec 11 a
+      File a ->
+        showString "file " . showsPrec 11 a
 
 -- | A `DirTreeN` is a `DirTreeNode` with a the directory as a recursive
 -- DirTree.
 type DirTreeN s a = DirTreeNode (FileMap (DirTree s a)) s a
 
-type FileMap a = [(String, a)]
-
 instance Semigroup (DirTree s a) where
   DirTree (Directory as) <> DirTree (Directory bs) =
-    DirTree (Directory (reverse . nubWith (<>) . reverse $ as <> bs))
+    DirTree (Directory (as <> bs))
   _ <> a = a
 
 instance Functor (DirTree s) where
-  fmap = mapDirTree id
+  fmap = mapDirTree' id
 
 instance Foldable (DirTree s) where
-  foldMap f = foldDirTree (foldDirTreeNode (foldMap snd) (const mempty) f)
+  foldMap = foldDirTree' (const mempty)
 
 instance Traversable (DirTree s) where
-  traverse = traverseDirTree pure
+  traverse = traverseDirTree' pure
+
+instance FunctorWithIndex FileKey (DirTree v)
+instance FoldableWithIndex FileKey (DirTree v)
+instance TraversableWithIndex FileKey (DirTree v) where
+  itraverse = itraverseDirTree' (const pure)
+  {-# INLINE itraverse #-}
 
 -- ** Constructors
 
@@ -141,31 +171,137 @@ symlink = DirTree . Symlink
 
 -- | Constructs a dirtree with a directory
 directory :: [(String, DirTree s a)] -> DirTree s a
-directory = DirTree . Directory
+directory = DirTree . Directory . FileMap
+
+-- ** Accessors
+
+-- | A filekey is the filepath in reverse order
+type FileKey = [String]
+
+fileKeyFromPath :: FilePath -> FileKey
+fileKeyFromPath =
+  reverse . splitDirectories
+
+fileKeyToPath :: FileKey -> FilePath
+fileKeyToPath =
+  joinPath . reverse
+
+diffFileKey :: FileKey -> FileKey -> FilePath
+diffFileKey f to' =
+  let (n, bs) = (suffix f to')
+  in fileKeyToPath (bs ++ replicate n "..")
+  where
+    suffix (a:as) (b:bs)
+      | a /= b =
+        (1 + length as, b:bs)
+      | otherwise =
+        suffix as bs
+    suffix (_:as) [] =
+      (1 + length as, [])
+    suffix [] bs =
+      (0, bs)
+
+
+lookupFile :: FileKey -> DirTree v a -> Maybe (DirTree v a)
+lookupFile fk = go (reverse fk)
+  where
+    go [] tree = Just tree
+    go (a:rest) (DirTree (Directory x)) =
+      go rest =<< lookupFileMap a x
+    go _ _ = Nothing
 
 -- ** Helpers
 
--- | Maps over a dir tree
-mapDirTree :: (s -> s') -> (a -> a') -> DirTree s a -> DirTree s' a'
-mapDirTree fs fa =
-    DirTree
-    . mapDirTreeNode (map.fmap.mapDirTree fs $ fa) fs fa
-    . dirTreeNode
+itraverseDirTree ::
+  Applicative f
+  => ( FileKey -> DirTreeNode (FileMap (f (DirTree s' a'))) s a -> f (DirTreeN s' a'))
+  -> DirTree s a
+  -> f (DirTree s' a')
+itraverseDirTree f = go []
+  where
+    go x (DirTree fs) = fmap DirTree . f x $
+      case fs of
+        Directory fm ->
+          Directory $ imap (\s a -> go (s:x) a) fm
+        Symlink a -> Symlink a
+        File a -> File a
+{-# inline itraverseDirTree #-}
+
+itraverseDirTree' ::
+  Applicative f
+  => (FileKey -> s -> f s') -> (FileKey -> a -> f a')
+  -> DirTree s a
+  -> f (DirTree s' a')
+itraverseDirTree' fs fa =
+  itraverseDirTree
+  (\key -> \case
+    Directory fm ->
+      Directory <$> traverse id fm
+    Symlink a -> Symlink <$> fs key a
+    File a -> File <$> fa key a
+  )
+{-# inline itraverseDirTree' #-}
+
+-- | Maps over a `DirTree`
+imapDirTree' :: (FileKey -> s -> s') -> (FileKey -> a -> a') -> DirTree s a -> DirTree s' a'
+imapDirTree' fs fa =
+  runIdentity . itraverseDirTree' (\i -> Identity . fs i) (\i -> Identity . fa i)
+{-# inline imapDirTree' #-}
+
+-- | Folds over a `DirTree`.
+ifoldDirTree' :: Monoid m => (FileKey -> s -> m) -> (FileKey -> a -> m) -> DirTree s a -> m
+ifoldDirTree' fs fa =
+  ifoldDirTree (\i -> foldDirTreeNode fold (fs i) (fa i))
+{-# inline ifoldDirTree' #-}
+
+-- | Folds over a `DirTree` using the `DirTreeNode`.
+ifoldDirTree :: (FileKey -> DirTreeNode (FileMap m) s a -> m) -> DirTree s a -> m
+ifoldDirTree f = go []
+  where
+    go x (DirTree fs) = f x $
+      case fs of
+        Directory fm ->
+          Directory $ imap (\s a -> go (s:x) a) fm
+        Symlink a -> Symlink a
+        File a -> File a
+{-# inline ifoldDirTree #-}
 
 -- | Traverse a DirTree
 traverseDirTree ::
+  Applicative f
+  => (DirTreeNode (FileMap (f (DirTree s' a'))) s a -> f (DirTreeN s' a'))
+  -> DirTree s a
+  -> f (DirTree s' a')
+traverseDirTree fm =
+  itraverseDirTree (const fm)
+{-# inline traverseDirTree #-}
+
+-- | Traverse a DirTree
+traverseDirTree' ::
   Applicative m
   => (s -> m s') -> (a -> m a')
   -> DirTree s a -> m (DirTree s' a')
-traverseDirTree fs fa =
-  fmap DirTree
-  . traverseDirTreeNode (traverse.traverse.traverseDirTree fs $ fa) fs fa
-  . dirTreeNode
+traverseDirTree' fs fa =
+  itraverseDirTree' (const fs) (const fa)
+{-# inline traverseDirTree' #-}
 
 -- | Folds over a dirtree
 foldDirTree :: (DirTreeNode (FileMap m) s a -> m) -> DirTree s a -> m
 foldDirTree f =
-  f . mapDirTreeNode (fmap . fmap $ foldDirTree f) id id . dirTreeNode
+  ifoldDirTree (const f)
+{-# inline foldDirTree #-}
+
+-- | Folds over a dirtree
+foldDirTree' :: Monoid m => (s -> m) -> (a -> m) -> DirTree s a -> m
+foldDirTree' fs fa =
+  ifoldDirTree' (const fs) (const fa)
+{-# inline foldDirTree' #-}
+
+-- | maps over a dirtree
+mapDirTree' :: (s -> s') -> (a -> a') -> DirTree s a -> DirTree s' a'
+mapDirTree' fs fa =
+  imapDirTree' (const fs) (const fa)
+{-# inline mapDirTree' #-}
 
 -- | Flatten a directory tree. This is usefull for following symlinks, or
 -- expanding zip-files.
@@ -175,130 +311,173 @@ flatten ::
   -> DirTree s a
   -> DirTree s' a'
 flatten s a =
-  foldDirTree (foldDirTreeNode directory s a)
+  foldDirTree (foldDirTreeNode (directory . toFileList) s a)
 
 -- * Utils
 
 -- | Recursively iterate over a folder.
-depthfirst :: Monoid m => FilePath -> (FilePath -> DirTreeNode [String] v a -> m) -> DirTree v a -> m
-depthfirst basefile fm =
-  flip runReader basefile . foldDirTree
-  (\file' -> do
-      fp <- ask
-      case file' of
-        Directory files -> do
-          let x = fm fp (Directory (map fst files))
-          rest <- mapM (\(s, a) -> local (</> s) a) files
-          return (x <> fold rest)
-        File a  ->
-          return $ fm fp (File a)
-        Symlink v  ->
-          return $ fm fp (Symlink v)
-  )
+depthfirst ::
+  Monoid m
+  =>(FileKey -> DirTreeNode [String] v a -> m)
+  -> DirTree v a
+  -> m
+depthfirst fm =
+  ifoldDirTree $ \key file' ->
+    case file' of
+      Directory files -> do
+        fm key (Directory $ toFileNames files) <> fold files
+      File a  ->
+        fm key (File a)
+      Symlink v  ->
+        fm key (Symlink v)
 
 findFile ::
-  (FilePath -> DirTreeNode [String] v a -> Bool)
+  (FileKey -> DirTreeNode [String] v a -> Bool)
   -> DirTree v a
-  -> Maybe (FilePath, DirTreeNode [String] v a)
+  -> Maybe (FileKey, DirTreeNode [String] v a)
 findFile f =
-  fmap getFirst . depthfirst "."
+  fmap getFirst . depthfirst
   (curry $ \case
       a | uncurry f a -> Just (First a)
         | otherwise -> Nothing
   )
 
-listFiles :: DirTree v a -> [(FilePath, DirTreeNode [String] v a)]
+listFiles :: DirTree v a -> [(FileKey, DirTreeNode [String] v a)]
 listFiles =
-  flip appEndo [] . depthfirst "." (curry $ Endo . (:))
+  flip appEndo [] . depthfirst (curry $ Endo . (:))
 
 forgetOrder :: DirTree v a -> DirTree v a
 forgetOrder =
-  DirTree
-  . mapDirTreeNode
-  (map (\(s, a) -> (s, forgetOrder a))
-   . List.sortOn fst) id id
-  . dirTreeNode
-
--- -- | Reads a DirTree
--- writeDirTreeWith ::
---   (FilePath -> a -> IO ())
---   -> FilePath
---   -> DirTree FilePath a
---   -> IO ()
--- writeDirTreeWith ffile fp =
-
-
+  DirTree . mapDirTreeNode forgetFileMapOrder id id . dirTreeNode
 
 -- ** IO Methods
 
--- | Reads a DirTree
+data Link
+  = Internal !FileKey
+  | External !FilePath
+  deriving (Show, Eq, Generic, NFData)
+
+-- | Reads a DirTree. All file paths are absolute to the filepath
 readDirTree ::
-  FilePath
-  -> IO (DirTree FilePath FilePath)
-readDirTree fp =
-  force <$> lazyReadDirTree fp
+  NFData a =>
+  (FilePath -> IO a)
+  -> FilePath
+  -> IO (DirTree Link a)
+readDirTree reader' fp = do
+  force <$> lazyReadDirTree reader' fp
 
 -- | Lazy read a DirTree. This function uses `unsafeInterleaveIO` to
 -- lazy interleave load a node. This means that it can be used to efficiently
--- search of a file.
+-- search of a file. All paths are absolute
 lazyReadDirTree ::
-  FilePath
-  -> IO (DirTree FilePath FilePath)
-lazyReadDirTree fp = unsafeInterleaveIO $ do
-  node <- readPath fp
-  foldDirTreeNode
-    (fmap directory . mapM (\s -> (s,) <$> lazyReadDirTree (fp </> s)))
-    (return . symlink . (
-        \case
-          a | isAbsolute a -> a
-            | otherwise -> takeDirectory fp </> a
-    ))
-    (const . return $ file fp)
-    node
+  (FilePath -> IO a)
+  -> FilePath
+  -> IO (DirTree Link a)
+lazyReadDirTree reader' basepath = do
+  from' <- canonicalizePath basepath
+  go from' [] basepath
+  where
+    go from' key fp = unsafeInterleaveIO $ do
+      node <- readPath fp
+      foldDirTreeNode
+        (fmap directory . mapM (\s -> (s,) <$> go from' (s:key) (fp </> s)))
+        (fmap symlink . absolute)
+        (const $ file <$> reader' fp)
+        node
+      where
+        absolute a
+          | isAbsolute a =
+              return $ External a
+          | otherwise = do
+            a' <- canonicalizePath (takeDirectory fp </> a)
+            let a'' =  makeRelative from' a'
+            if a'' /= a'
+              then return $ Internal (fileKeyFromPath a'')
+              else return $ External a'
+
+-- | Reads a DirTree
+writeDirTree ::
+  (FilePath -> a -> IO ())
+  -> FilePath
+  -> DirTree Link a
+  -> IO ()
+writeDirTree writer fp tree = do
+  ifoldDirTree
+    ( \fk i ->
+      let fp' = fp </> fileKeyToPath fk in
+      case i of
+        Directory m -> do
+          createDirectory fp'
+          fold m
+        Symlink (External target) ->
+          createFileLink target fp'
+        Symlink (Internal key) ->
+          createFileLink
+          (case (fk, key) of
+              (_:fk',  _) -> diffFileKey fk' key
+              ([],    []) -> "."
+              ([],     _) -> error "Fail"
+          ) fp'
+        File a ->
+          writer fp' a
+    )
+    tree
+
 
 -- | Follow the links to create the tree. This function might recurse forever.
-followLinks :: DirTree FilePath FilePath -> IO (DirTree Void FilePath)
-followLinks dt =
-  force <$> lazyFollowLinks dt
+followLinks :: NFData a => (FilePath -> IO a) -> DirTree Link a -> IO (DirTree Void a)
+followLinks fio dt =
+  force <$> lazyFollowLinks fio dt
 
 -- | Like follow links but uses lazy io to only load the recursive folder when
 -- needed.
-lazyFollowLinks :: DirTree FilePath FilePath -> IO (DirTree Void FilePath)
-lazyFollowLinks =
-  unsafeInterleaveIO
-  . fmap (flatten id file)
-  . traverseDirTree
-    (followLinks <=< readDirTree)
-    pure
+lazyFollowLinks :: (FilePath -> IO a) -> DirTree Link a -> IO (DirTree Void a)
+lazyFollowLinks reader' tree =
+  go tree tree
+  where
+    go basetree =
+      unsafeInterleaveIO
+      . fmap (flatten id file)
+      . traverseDirTree' (readLink basetree) pure
 
--- | Follow the links to create the tree. The first argument is max depth.
--- Give a negative number to possible recurse forever.
-followLinksLimit :: Int -> DirTree FilePath FilePath -> IO (DirTree FilePath FilePath)
-followLinksLimit 0 = pure
-followLinksLimit n =
-  fmap (flatten id file)
-  . traverseDirTree
-    (followLinksLimit (n - 1) <=< readDirTree)
-    pure
+    readLink basetree = \case
+      Internal s -> do
+        case lookupFile s basetree of
+          Just a -> go basetree a
+          Nothing ->
+            error $ "Could not find " ++ show s ++ " in the dirtree " ++ show (fmap (const ()) tree)
+      External s -> do
+        t <- lazyReadDirTree reader' s
+        lazyFollowLinks reader' t
 
--- | Read all the files in the `DirTree`. This is just a specialiezed
--- `traverse`
-readFiles :: (FilePath -> IO a) -> DirTree v FilePath -> IO (DirTree v a)
-readFiles = traverse
-{-# INLINE readFiles #-}
 
--- | Write a `DirTree` to the folder
-writeDirTree :: (FilePath -> a -> IO ()) -> FilePath -> DirTree FilePath a -> IO ()
-writeDirTree writeFileF fp =
-  depthfirst fp (\f -> \case
-    Directory _ -> do
-      createDirectory f
-    Symlink target
-      | isAbsolute target -> createFileLink target f
-      | otherwise -> createFileLink (makeRelative fp target) f
-    File a ->
-      writeFileF f a
-  )
+-- -- | Follow the links to create the tree. The first argument is max depth.
+-- -- Give a negative number to possible recurse forever.
+-- followLinksLimit :: Int -> DirTree Link FilePath -> IO (DirTree Link FilePath)
+-- followLinksLimit 0 = pure
+-- followLinksLimit n =
+--   fmap (flatten id file)
+--   . traverseDirTree
+--     ((followLinksLimit (n - 1) <=< readDirTree) . pathFromLink)
+--     pure
+
+-- -- | Read all the files in the `DirTree`. This is just a specialiezed
+-- -- `traverse`
+-- readFiles :: (FilePath -> IO a) -> DirTree v FilePath -> IO (DirTree v a)
+-- readFiles = traverse
+-- {-# INLINE readFiles #-}
+
+-- -- | Write a `DirTree` to the folder
+-- writeDirTree :: (FilePath -> a -> IO ()) -> FilePath -> DirTree Link a -> IO ()
+-- writeDirTree writeFileF fp =
+--   depthfirst fp (\f -> \case
+--     Directory _ -> do
+--       createDirectory f
+--     Symlink (External target) -> createFileLink target f
+--     Symlink (Internal _ target) -> createFileLink target f
+--     File a ->
+--       writeFileF f a
+--   )
 
 -- * DirTreeNode
 
@@ -397,7 +576,34 @@ writePathWith ffile ffolder fp node = do
     (ffile)
     node
 
--- * Utils
+newtype FileMap a =
+  FileMap [(String, a)]
+  deriving (Eq, Ord, NFData, Generic, Functor, Foldable, Traversable)
+
+toFileList :: FileMap a -> [(String, a)]
+toFileList (FileMap a) = a
+
+toFileNames :: FileMap a -> [String]
+toFileNames = map fst . toFileList
+
+lookupFileMap :: String -> FileMap a -> Maybe a
+lookupFileMap s (FileMap a) = List.lookup s a
+
+instance Semigroup a => Semigroup (FileMap a) where
+  FileMap as <> FileMap bs =
+    FileMap (reverse . nubWith (<>) . reverse $ as <> bs)
+
+instance Semigroup a => Monoid (FileMap a) where
+  mempty = FileMap []
+
+instance FunctorWithIndex String FileMap
+instance FoldableWithIndex String FileMap
+instance TraversableWithIndex String FileMap where
+  itraverse f (FileMap fs) = FileMap <$> traverse (itraverse f) fs
+  {-# INLINE itraverse #-}
+
+forgetFileMapOrder :: FileMap a -> FileMap a
+forgetFileMapOrder (FileMap a) = FileMap (List.sortOn fst a)
 
 nubSet :: Ord a => [a] -> [a]
 nubSet = go Set.empty

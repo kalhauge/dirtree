@@ -1,6 +1,6 @@
 module System.DirTreeSpec where
 
-import Test.Hspec (Spec, describe, it, before)
+import Test.Hspec (Spec, describe, it, before, describe)
 import Test.Hspec.Expectations.Pretty
 
 import System.DirTree
@@ -28,7 +28,7 @@ spec = do
   describe "readPath" $ do
     it "should find a directory" $ do
       readPath "test/data" `shouldReturn`
-        Directory ["symlink", "file", "folderlink", "folder", "abslink"]
+        Directory ["symlink", "file", "folderlink", "folder", "abslink", "deeplink"]
 
     it "should find a file" $ do
       readPath "test/data/file" `shouldReturn`
@@ -47,55 +47,72 @@ spec = do
 
   describe "readDirTree" $ do
     it "should read the data directory" $ do
-      readDirTree "test/data" `shouldReturn`
-        DirTree (Directory
-                 [ ("symlink", DirTree (Symlink "test/data/file"))
-                 , ("file", DirTree (File "test/data/file"))
-                 , ("folderlink", DirTree (Symlink "test/data/folder"))
-                 , ("folder", DirTree
-                     (Directory [
-                         ("deepfile", DirTree (File "test/data/folder/deepfile"))
-                         ]))
-                 , ("abslink", DirTree (Symlink "/dev/null"))
-                 ])
+      readDirTree (\f -> return $ makeRelative "test/data" f) "test/data" `shouldReturn`
+        directory
+        [ ("symlink", symlink (Internal ["file"]))
+        , ("file", file "file")
+        , ("folderlink", symlink (Internal ["folder"]))
+        , ("folder", directory
+          [ ("revlink", symlink (Internal ["file"]))
+          , ("deepfile", file "folder/deepfile")
+          ])
+        , ("abslink", symlink (External "/dev/null"))
+        , ("deeplink", symlink (Internal ["deepfile", "folder"]))
+        ]
+
+    it "should read the folder in the data directory" $ do
+      x <- makeAbsolute "test/data/file"
+      readDirTree (\f -> return $ makeRelative "test/data/folder" f) "test/data/folder" `shouldReturn`
+        directory
+        [ ("revlink", symlink (External x))
+        , ("deepfile", file "deepfile")
+        ]
 
   describe "followLinks" $ do
     it "should read and follow the links in the data directory" $ do
-      (readDirTree "test/data" >>= followLinks)
+      let relname f = return $ makeRelative "test/data" f
+      (readDirTree relname "test/data" >>= followLinks relname)
         `shouldReturn`
-          DirTree (Directory
-                   [ ("symlink", DirTree (File "test/data/file"))
-                   , ("file", DirTree (File "test/data/file"))
-                   , ("folderlink", DirTree
-                       (Directory [("deepfile", DirTree (File "test/data/folder/deepfile"))]))
-                   , ("folder", DirTree
-                       (Directory [("deepfile", DirTree (File "test/data/folder/deepfile"))]))
-                   , ("abslink", DirTree (File "/dev/null"))
-                   ])
+        directory
+        [ ("symlink", file "file")
+        , ("file", file "file")
+        , ("folderlink", directory
+          [ ("revlink", file "file")
+          , ("deepfile", file "folder/deepfile")
+          ])
+        , ("folder", directory
+          [ ("revlink", file "file")
+          , ("deepfile", file "folder/deepfile")
+          ])
+        , ("abslink", file "/dev/null")
+        , ("deeplink", file "folder/deepfile")
+        ]
 
   describe "listFiles" $ do
     it "should read the data directory" $ do
-      x <- listFiles <$> readDirTree "test/data"
+      x <- listFiles <$> readDirTree return "test/data"
       map fst x `shouldBe`
-        [ "."
-        , "./symlink"
-        , "./file"
-        , "./folderlink"
-        , "./folder"
-        , "./folder/deepfile"
-        , "./abslink"
+        [ []
+        , ["symlink"]
+        , ["file"]
+        , ["folderlink"]
+        , ["folder"]
+        , ["revlink", "folder"]
+        , ["deepfile", "folder"]
+        , ["abslink"]
+        , ["deeplink"]
         ]
 
   describe "findFile" $ do
     it "can find deepfile" $ do
-      x <- findFile (\fp _ -> takeBaseName fp == "deepfile") <$> readDirTree "test/data"
-      fmap fst x `shouldBe` Just "./folder/deepfile"
+      x <- findFile (\fp _ -> takeBaseName (fileKeyToPath fp) == "deepfile") <$> readDirTree return "test/data"
+      fmap fst x `shouldBe` Just ["deepfile", "folder"]
 
     it "can't find notafile" $ do
-      x <- findFile (\fp _ -> takeBaseName fp == "notafile") <$> readDirTree "test/data"
+      x <- findFile (\fp _ -> takeBaseName (fileKeyToPath fp) == "notafile") <$> readDirTree return "test/data"
       fmap fst x `shouldBe` Nothing
 
-  describe "findFile" $ do
+  describe "writeDirTree" $ do
     before (do
                _ <- tryIOError $ removeDirectoryRecursive "test/output/"
                createDirectory "test/output"
@@ -103,15 +120,21 @@ spec = do
       it "can write a file" $ do
         let newfile = file "Hello, World!"
         writeDirTree writeFile "test/output/newfile" newfile
-
         readFile "test/output/newfile" `shouldReturn` "Hello, World!"
 
       it "can write a folder" $ do
         let folder = directory
               [ ("file1", file "Hello, World!" )
               , ("file2", file "Some other file" )
-              , ("file3", symlink "test/output/folder/file2" )
+              , ("file3", symlink (Internal ["file2"]))
               ]
         writeDirTree writeFile "test/output/folder" folder
-        forgetOrder <$> (readFiles readFile =<< readDirTree "test/output/folder")
+        forgetOrder <$> readDirTree readFile "test/output/folder"
           `shouldReturn` folder
+
+      it "can copy a folder" $ do
+        datatree1 <- readDirTree return "test/data"
+        writeDirTree (flip copyFile) "test/output/data" datatree1
+        datatree2 <- readDirTree (return . ("test/data" </>) . makeRelative "test/output/data") "test/output/data"
+
+        datatree2 `shouldBe` datatree1

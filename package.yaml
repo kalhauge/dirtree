@@ -20,7 +20,7 @@ dependencies:
   - containers
   - deepseq
   - filepath
-  - mtl
+  - lens
 
 library:
     source-dirs: src
