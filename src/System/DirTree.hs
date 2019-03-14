@@ -26,6 +26,10 @@ module System.DirTree
  , symlink
  , directory
 
+ , fromFiles
+ , fromFile
+ , toFiles
+
  -- ** Accessors
  , FileKey
  , fileKeyToPath
@@ -35,7 +39,6 @@ module System.DirTree
 
  -- ** Traversals
  -- These function are used for folding over the DirTree
-
 
  , traverseDirTree
  , traverseDirTree'
@@ -54,8 +57,8 @@ module System.DirTree
  , flatten
 
  -- ** Utils
- , findFile
- , listFiles
+ , findNode
+ , listNodes
  , forgetOrder
 
  -- ** IO operations
@@ -96,6 +99,7 @@ module System.DirTree
 
 -- containers
 import qualified Data.List                as List
+import qualified Data.List.NonEmpty       as NonEmpty
 import qualified Data.Map                 as Map
 import qualified Data.Set                 as Set
 
@@ -215,8 +219,23 @@ lookupFile fk = go (reverse fk)
     go _ _ = Nothing
 {-# inline lookupFile #-}
 
+toFiles :: DirTree v a -> [(FileKey, a)]
+toFiles = itoList
+{-# INLINE toFiles #-}
+
+-- | Create a dirtree from a non-empty list of files.
+fromFiles :: NonEmpty.NonEmpty (FileKey, a) -> DirTree Void a
+fromFiles =
+  sconcat . fmap (uncurry fromFile)
+{-# INLINE fromFiles #-}
+
+fromFile :: FileKey -> a -> DirTree Void a
+fromFile key a =
+  foldr (\s f -> directory [(s, f)]) (file a) key
+
 -- ** Helpers
 
+-- | Traverse over the tree
 itraverseDirTree ::
   Applicative f
   => ( FileKey -> DirTreeNode (FileMap (f (DirTree s' a'))) s a -> f (DirTreeN s' a'))
@@ -232,6 +251,8 @@ itraverseDirTree f = go []
         File a -> File a
 {-# inline itraverseDirTree #-}
 
+-- | Traverse over the tree with index. This method uses two functions one
+-- symlinks and one for files.
 itraverseDirTree' ::
   Applicative f
   => (FileKey -> s -> f s') -> (FileKey -> a -> f a')
@@ -339,23 +360,23 @@ depthfirst fm =
 {-# inline depthfirst #-}
 
 -- | Find a file given a predicate that takes a `FileKey` and `DirTreeNode`.
-findFile ::
+findNode ::
   (FileKey -> DirTreeNode [String] v a -> Bool)
   -> DirTree v a
   -> Maybe (FileKey, DirTreeNode [String] v a)
-findFile f =
+findNode f =
   fmap getFirst . depthfirst
   (curry $ \case
       a | uncurry f a -> Just (First a)
         | otherwise -> Nothing
   )
-{-# inline findFile #-}
+{-# inline findNode #-}
 
--- | List all the files in the `DirTree`.
-listFiles :: DirTree v a -> [(FileKey, DirTreeNode [String] v a)]
-listFiles =
+-- | List all the nodes in the `DirTree`.
+listNodes :: DirTree v a -> [(FileKey, DirTreeNode [String] v a)]
+listNodes =
   flip appEndo [] . depthfirst (curry $ Endo . (:))
-{-# inline listFiles #-}
+{-# inline listNodes #-}
 
 -- | Forget the internal order of forget.
 forgetOrder :: DirTree v a -> DirTree v a

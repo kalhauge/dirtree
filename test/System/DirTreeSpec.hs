@@ -88,9 +88,9 @@ spec = do
         , ("deeplink", file "folder/deepfile")
         ]
 
-  describe "listFiles" $ do
+  describe "listNodes" $ do
     it "should read the data directory" $ do
-      x <- listFiles <$> readDirTree return "test/data"
+      x <- listNodes <$> readDirTree return "test/data"
       map fst x `shouldBe`
         [ []
         , ["symlink"]
@@ -103,13 +103,13 @@ spec = do
         , ["deeplink"]
         ]
 
-  describe "findFile" $ do
+  describe "findNode" $ do
     it "can find deepfile" $ do
-      x <- findFile (\fp _ -> takeBaseName (fileKeyToPath fp) == "deepfile") <$> readDirTree return "test/data"
+      x <- findNode (\fp _ -> takeBaseName (fileKeyToPath fp) == "deepfile") <$> readDirTree return "test/data"
       fmap fst x `shouldBe` Just ["deepfile", "folder"]
 
     it "can't find notafile" $ do
-      x <- findFile (\fp _ -> takeBaseName (fileKeyToPath fp) == "notafile") <$> readDirTree return "test/data"
+      x <- findNode (\fp _ -> takeBaseName (fileKeyToPath fp) == "notafile") <$> readDirTree return "test/data"
       fmap fst x `shouldBe` Nothing
 
   describe "writeDirTree" $ do
