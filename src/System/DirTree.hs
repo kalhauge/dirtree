@@ -25,8 +25,11 @@ module System.DirTree
  , file
  , symlink
  , directory
+ , directoryFromFiles
 
+ -- ** Constructors
  , fromFiles
+ , fromFiles'
  , fromFile
  , toFiles
 
@@ -59,7 +62,6 @@ module System.DirTree
  -- ** Utils
  , findNode
  , listNodes
- , forgetOrder
 
  -- ** IO operations
  -- These functions can be used to read a DirTree from the file system.
@@ -90,18 +92,23 @@ module System.DirTree
  , DirTreeN
 
  -- * FileMap
- , FileMap (..)
+ , FileMap
  , toFileList
  , fromFileList
+
+ , (-.>), (-|>), (-/>)
+
+ , toDeepFileList
+ , fromDeepFileList
+
  , toFileNames
  , lookupFileMap
+ , emptyFileMap
  ) where
 
 -- containers
-import qualified Data.List                as List
 import qualified Data.List.NonEmpty       as NonEmpty
 import qualified Data.Map                 as Map
-import qualified Data.Set                 as Set
 
 -- deepseq
 import           Control.DeepSeq
@@ -120,6 +127,7 @@ import           Control.Lens.Combinators
 import           Data.Foldable
 import           Data.Semigroup
 import           Data.Void
+import           Text.Show
 import           GHC.Generics
 import           System.IO.Unsafe
 -- * DirTree
@@ -134,7 +142,7 @@ instance (Show v, Show c) => Show (DirTree v c) where
   showsPrec d c = showParen (d >9) $ (f $ dirTreeNode c)
     where
     f = \case
-      Directory (FileMap a) ->
+      Directory a ->
         showString "directory " . showsPrec 11 a
       Symlink a ->
         showString "symlink " . showsPrec 11 a
@@ -176,8 +184,12 @@ symlink :: s -> DirTree s a
 symlink = DirTree . Symlink
 
 -- | Constructs a dirtree with a directory
-directory :: [(String, DirTree s a)] -> DirTree s a
-directory = DirTree . Directory . FileMap
+directory :: FileMap (DirTree s a) -> DirTree s a
+directory = DirTree . Directory
+
+-- | Constructs a dirtree with a directory
+directoryFromFiles :: [(String, DirTree s a)] -> DirTree s a
+directoryFromFiles = DirTree . Directory . fromFileList
 
 -- ** Accessors
 
@@ -219,19 +231,33 @@ lookupFile fk = go (reverse fk)
     go _ _ = Nothing
 {-# inline lookupFile #-}
 
-toFiles :: DirTree v a -> [(FileKey, a)]
-toFiles = itoList
+toFiles :: DirTree v a -> [(FileKey, Either v a)]
+toFiles =
+  flip appEndo []
+  . ifoldDirTree' (\i s -> Endo ((i, Left s):)) (\i s -> Endo ((i, Right s):))
 {-# INLINE toFiles #-}
 
 -- | Create a dirtree from a non-empty list of files.
-fromFiles :: NonEmpty.NonEmpty (FileKey, a) -> DirTree Void a
+fromFiles :: [(FileKey, Either v a)] -> Maybe (DirTree v a)
 fromFiles =
-  sconcat . fmap (uncurry fromFile)
+  fmap fromFiles' . NonEmpty.nonEmpty
 {-# INLINE fromFiles #-}
+
+-- | Create a dirtree from a non-empty list of files.
+fromFiles' :: NonEmpty.NonEmpty (FileKey, Either v a) -> DirTree v a
+fromFiles' =
+  sconcat . fmap (uncurry fromPath)
+{-# INLINE fromFiles' #-}
+
+fromPath :: FileKey -> Either s a -> DirTree s a
+fromPath key a =
+  foldr (\s f -> directory (singleFile s f)) (either symlink file a) key
+{-# INLINE fromPath #-}
 
 fromFile :: FileKey -> a -> DirTree Void a
 fromFile key a =
-  foldr (\s f -> directory [(s, f)]) (file a) key
+  foldr (\s f -> directory (singleFile s f)) (file a) key
+{-# INLINE fromFile #-}
 
 -- ** Helpers
 
@@ -337,7 +363,7 @@ flatten ::
   -> DirTree s a
   -> DirTree s' a'
 flatten s a =
-  foldDirTree (foldDirTreeNode (directory . toFileList) s a)
+  foldDirTree (foldDirTreeNode directory s a)
 {-# inline flatten #-}
 
 -- * Utils
@@ -378,11 +404,6 @@ listNodes =
   flip appEndo [] . depthfirst (curry $ Endo . (:))
 {-# inline listNodes #-}
 
--- | Forget the internal order of forget.
-forgetOrder :: DirTree v a -> DirTree v a
-forgetOrder =
-  DirTree . mapDirTreeNode forgetFileMapOrder id id . dirTreeNode
-{-# inline forgetOrder #-}
 
 -- ** IO Methods
 
@@ -416,7 +437,7 @@ lazyReadDirTree reader' basepath = do
     go from' key fp = unsafeInterleaveIO $ do
       node <- readPath fp
       foldDirTreeNode
-        (fmap directory . mapM (\s -> (s,) <$> go from' (s:key) (fp </> s)))
+        (fmap directory . imapM (\s _ -> go from' (s:key) (fp </> s)) . fromFilenames)
         (fmap symlink . absolute)
         (const $ file <$> reader' fp)
         node
@@ -430,6 +451,8 @@ lazyReadDirTree reader' basepath = do
             if a'' /= a'
               then return $ Internal (fileKeyFromPath a'')
               else return $ External a'
+{-# INLINE lazyReadDirTree #-}
+
 
 -- | Reads a DirTree
 writeDirTree ::
@@ -458,11 +481,14 @@ writeDirTree writer fp tree = do
           writer fp' a
     )
     tree
+{-# INLINE writeDirTree #-}
 
 -- | Follow the links to create the tree. This function might recurse forever.
 followLinks :: NFData a => (FilePath -> IO a) -> DirTree Link a -> IO (DirTree Void a)
 followLinks fio dt =
   force <$> lazyFollowLinks fio dt
+{-# INLINE followLinks #-}
+
 
 -- | Like follow links but uses lazy io to only load the recursive folder when
 -- needed.
@@ -569,16 +595,38 @@ readPath fp = do
 
 -- | A map from file names to
 newtype FileMap a =
-  FileMap [(String, a)]
+  FileMap (Map.Map String a)
   deriving (Eq, Ord, NFData, Generic, Functor, Foldable, Traversable)
+
+
+(-.>) :: String -> a -> (String, DirTree x a)
+(-.>) s a = (s, file a)
+
+(-|>) :: String -> a -> (String, DirTree a x)
+(-|>) s a = (s, symlink a)
+
+(-/>) :: String -> [(String, DirTree a b)] -> (String, DirTree a b)
+(-/>) s a = (s, directoryFromFiles a)
 
 -- | Create a list of pairs of filenames and file values.
 toFileList :: FileMap a -> [(String, a)]
-toFileList (FileMap a) = a
+toFileList (FileMap a) = Map.toList a
 
 -- | Create a `FileMap` from a list of pairs of filenames a file values.
 fromFileList :: [(String, a)] -> FileMap a
-fromFileList = FileMap
+fromFileList = FileMap . Map.fromList
+
+-- | Create a `FileMap` from a list of pairs of filenames a file values.
+fromFilenames :: [String] -> FileMap ()
+fromFilenames = fromFileList . map (,())
+
+-- | Single File
+singleFile :: String ->  a -> FileMap a
+singleFile s a = FileMap (Map.singleton s a)
+
+-- | empty filemap
+emptyFileMap :: FileMap a
+emptyFileMap = FileMap Map.empty
 
 -- | To a list of filenames
 toFileNames :: FileMap a -> [String]
@@ -586,38 +634,59 @@ toFileNames = map fst . toFileList
 
 -- | Lookup a file using a filename
 lookupFileMap :: String -> FileMap a -> Maybe a
-lookupFileMap s (FileMap a) = List.lookup s a
+lookupFileMap s (FileMap a) = Map.lookup s a
+
+-- | Returns a list of `FileMap`
+toDeepFileList ::  FileMap (DirTree s a) -> [(FileKey, Either s a)]
+toDeepFileList fm =
+  toFiles $ directory fm
+
+-- | Returns an empty `FileMap`, if the input list is empty or contains files
+-- that does not correspond to a `FileMap`.
+fromDeepFileList ::  [(FileKey, Either s a)] -> FileMap (DirTree s a)
+fromDeepFileList lst =
+  maybe emptyFileMap
+  ((\case
+      Directory fm -> fm
+      _ -> emptyFileMap
+  ) . dirTreeNode)
+  $ fromFiles lst
+
+instance (Show a, Show b) => Show (FileMap (DirTree a b)) where
+  showsPrec d m = showParen (d > 9) $ showString "fromFileList " . showFileList m
+    where
+      showFileList =
+        showListWith (\(s, x) -> f s $ dirTreeNode x) . toFileList
+
+      f s (Directory x) =
+        showsPrec (dir_prec+1) s .
+        showString " -/> "      .
+        showFileList x
+
+      f s (Symlink x) =
+        showsPrec (dir_prec+1) s .
+        showString " -|> "      .
+        showsPrec (dir_prec+1) x
+
+      f s (File x) =
+        showsPrec (dir_prec+1) s .
+        showString " -.> "      .
+        showsPrec (dir_prec+1) x
+      dir_prec = 5
+
 
 instance Semigroup a => Semigroup (FileMap a) where
   FileMap as <> FileMap bs =
-    FileMap (reverse . nubWith (<>) . reverse $ as <> bs)
+    FileMap (Map.unionWith (<>) as bs)
 
 instance Semigroup a => Monoid (FileMap a) where
-  mempty = FileMap []
+  mempty = emptyFileMap
 
 instance FunctorWithIndex String FileMap
 instance FoldableWithIndex String FileMap
 instance TraversableWithIndex String FileMap where
-  itraverse f (FileMap fs) = FileMap <$> traverse (itraverse f) fs
+  itraverse f (FileMap fs) = FileMap <$> itraverse f fs
   {-# INLINE itraverse #-}
-
-forgetFileMapOrder :: FileMap a -> FileMap a
-forgetFileMapOrder (FileMap a) = FileMap (List.sortOn fst a)
-
-nubSet :: Ord a => [a] -> [a]
-nubSet = go Set.empty
-  where
-    go s = \case
-      [] -> []
-      a:as
-        | a `Set.member` s -> go s as
-        | otherwise -> go (Set.insert a s) as
-
-nubWith :: Ord k => (a -> a -> a) -> [(k, a)] -> [(k, a)]
-nubWith fmerge m = do
-  key <- nubSet (map fst m)
-  return (key, mergedvalues Map.! key)
-  where mergedvalues = Map.fromListWith (fmerge) m
 
 data Anchored a = (:/)
   { base    ::  FilePath

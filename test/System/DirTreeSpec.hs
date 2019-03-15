@@ -48,22 +48,22 @@ spec = do
   describe "readDirTree" $ do
     it "should read the data directory" $ do
       readDirTree (\f -> return $ makeRelative "test/data" f) "test/data" `shouldReturn`
-        directory
-        [ ("symlink", symlink (Internal ["file"]))
+        directoryFromFiles
+        [ ("abslink", symlink (External "/dev/null"))
         , ("file", file "file")
         , ("folderlink", symlink (Internal ["folder"]))
-        , ("folder", directory
+        , ("folder", directoryFromFiles
           [ ("revlink", symlink (Internal ["file"]))
           , ("deepfile", file "folder/deepfile")
           ])
-        , ("abslink", symlink (External "/dev/null"))
         , ("deeplink", symlink (Internal ["deepfile", "folder"]))
+        , ("symlink", symlink (Internal ["file"]))
         ]
 
     it "should read the folder in the data directory" $ do
       x <- makeAbsolute "test/data/file"
       readDirTree (\f -> return $ makeRelative "test/data/folder" f) "test/data/folder" `shouldReturn`
-        directory
+        directoryFromFiles
         [ ("revlink", symlink (External x))
         , ("deepfile", file "deepfile")
         ]
@@ -73,14 +73,14 @@ spec = do
       let relname f = return $ makeRelative "test/data" f
       (readDirTree relname "test/data" >>= followLinks relname)
         `shouldReturn`
-        directory
+        directoryFromFiles
         [ ("symlink", file "file")
         , ("file", file "file")
-        , ("folderlink", directory
+        , ("folderlink", directoryFromFiles
           [ ("revlink", file "file")
           , ("deepfile", file "folder/deepfile")
           ])
-        , ("folder", directory
+        , ("folder", directoryFromFiles
           [ ("revlink", file "file")
           , ("deepfile", file "folder/deepfile")
           ])
@@ -93,14 +93,14 @@ spec = do
       x <- listNodes <$> readDirTree return "test/data"
       map fst x `shouldBe`
         [ []
-        , ["symlink"]
-        , ["file"]
-        , ["folderlink"]
-        , ["folder"]
-        , ["revlink", "folder"]
-        , ["deepfile", "folder"]
         , ["abslink"]
         , ["deeplink"]
+        , ["file"]
+        , ["folder"]
+        , ["deepfile", "folder"]
+        , ["revlink", "folder"]
+        , ["folderlink"]
+        , ["symlink"]
         ]
 
   describe "findNode" $ do
@@ -123,14 +123,13 @@ spec = do
         readFile "test/output/newfile" `shouldReturn` "Hello, World!"
 
       it "can write a folder" $ do
-        let folder = directory
+        let folder = directoryFromFiles
               [ ("file1", file "Hello, World!" )
               , ("file2", file "Some other file" )
               , ("file3", symlink (Internal ["file2"]))
               ]
         writeDirTree writeFile "test/output/folder" folder
-        forgetOrder <$> readDirTree readFile "test/output/folder"
-          `shouldReturn` folder
+        readDirTree readFile "test/output/folder" `shouldReturn` folder
 
       it "can copy a folder" $ do
         datatree1 <- readDirTree return "test/data"
@@ -138,3 +137,47 @@ spec = do
         datatree2 <- readDirTree (return . ("test/data" </>) . makeRelative "test/output/data") "test/output/data"
 
         datatree2 `shouldBe` datatree1
+
+  describe "semigroup" $ do
+    it "can join trees together" $ do
+      directoryFromFiles ["a" -.> "x"]
+        <> directoryFromFiles [ "b" -|> "x" ]
+        <> directoryFromFiles [ "x" -/> [ "a" -.> "y"]]
+        <> directoryFromFiles [ "x" -/> [ "b" -.> "y"]]
+        `shouldBe`
+        directoryFromFiles
+         [ "a" -.> "x"
+         , "b" -|> "x"
+         , "x" -/>
+           [ "a" -.> "y"
+           , "b" -.> "y"
+           ]
+         ]
+
+    it "joins different types to latest file" $ do
+      directoryFromFiles ["a" -.> "x"]
+        <> directoryFromFiles [ "a" -|> "y" ]
+        `shouldBe`
+        directoryFromFiles
+         [ "a" -|> "y"
+         ]
+
+    it "can join FileMaps together" $ do
+      fromFileList ["a" -.> "x"]
+        <> fromFileList [ "b" -|> "x" ]
+        `shouldBe`
+        fromFileList
+         [ "a" -.> "x"
+         , "b" -|> "x"
+         ]
+
+  describe "fromFiles" $ do
+    it "can create a DirTree from an list of files" $ do
+      fromFiles [(["a"], Right "x"), (["b", "c"], Left "y") ]
+        `shouldBe`
+        (Just $ directoryFromFiles
+         [ "a" -.> "x"
+         , "b" -/>
+           [ "c" -|> "y"
+           ]
+         ])
