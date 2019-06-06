@@ -1,7 +1,7 @@
 name:                dirtree
 version:             0.0.1
 synopsis:            A small library for working with directories.
-description:         A small library for working with directories.
+description:         A small library for loading and building directories as trees.
 homepage:            https://github.com/kalhauge/dirtree#readme
 author:              Christian Gram Kalhauge
 maintainer:          christian@kalhauge.dk
