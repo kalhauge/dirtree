@@ -1,13 +1,12 @@
 name:                dirtree
 version:             0.0.1
-#synopsis:
-#description:
+synopsis:            A small library for working with directories.
+description:         A small library for working with directories.
 homepage:            https://github.com/kalhauge/dirtree#readme
-license:             BSD3
 author:              Christian Gram Kalhauge
-maintainer:          kalhauge@cs.ucla.edu
+maintainer:          christian@kalhauge.dk
 copyright:           MIT
-category:            Web
+category:            System
 extra-source-files:
 - README.md
     
