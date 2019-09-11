@@ -79,6 +79,7 @@ module System.DirTree
  , fileKeyFromPath
  , fileKeyToPath
  , diffFileKey
+ , diffPath
 
  , alterFile
 
@@ -98,6 +99,7 @@ module System.DirTree
  , readDirTree
  , writeDirTree
  , Link (..)
+ , toLink
  , readRelativeDirTree
  , followLinks
  , writeRelativeDirTree
@@ -470,6 +472,34 @@ diffFileKey f to' =
     prefix [] bs =
       (0, bs)
 
+-- | 'diffPath' produces a the filekey at the end of
+-- a relative filepath, from one filekey.
+--
+-- >>> diffPath ["hello", "world"] ".."
+-- Just ["hello"]
+--
+-- >>> diffPath ["hello"] "world/test"
+-- Just ["hello","world","test"]
+--
+-- >>> diffPath ["world", "test"] "../../hello"
+-- Just ["hello"]
+--
+-- >>> diffPath ["world", "test"] "/hello"
+-- Nothing
+--
+-- >>> diffPath ["world", "test"] "../../.."
+-- Nothing
+diffPath :: FileKey -> FilePath -> Maybe FileKey
+diffPath f path
+  | isAbsolute path = Nothing
+  | otherwise = go (fileKeyFromPath path) (reverse f)
+  where
+    go = \case
+      "..":rest -> \case
+        _:as -> go rest as
+        [] -> Nothing
+      rest -> \m -> Just (reverse m ++ rest)
+
 -- | Alter File is the 'DirTree' version of 'Map.alterF'.
 --
 -- >>> alterFile (\x -> [Nothing, x, Just (file 'b')]) [] (Just (file 'a'))
@@ -502,7 +532,7 @@ createDeepFile key a =
 -- | Create a recursive `DirTree` from a FileKey and a value.
 createDeepDirTree :: FileKey -> DirTree a -> DirTree a
 createDeepDirTree key a =
-  foldl' (\f s -> directory (singletonFileMap s f)) a key
+  foldr (\s f -> directory (singletonFileMap s f)) a key
 {-# INLINE createDeepDirTree #-}
 
 type instance Index (DirTree a) = FileKey
@@ -585,6 +615,12 @@ data Link
   = Internal !FileKey
   | External !FilePath
   deriving (Show, Eq, Generic, NFData)
+
+-- | Figure out a link from the FileKey and FilePath of Link
+toLink :: FileKey -> FilePath -> Link
+toLink key f =
+  maybe (External f) Internal (diffPath (Prelude.init key) f)
+
 
 -- | Reads a DirTree. All file paths are absolute to the filepath
 readRelativeDirTree ::
@@ -675,3 +711,4 @@ writeDirTree ::
   -> IO ()
 writeDirTree writer fp = writeRelativeDirTree writer fp . asRelativeDirTree
 {-# INLINE writeDirTree #-}
+

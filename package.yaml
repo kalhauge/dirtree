@@ -20,6 +20,9 @@ dependencies:
   - deepseq
   - filepath
   - lens
+  - zip-archive
+  - bytestring
+  - unix
 
 library:
     source-dirs: src

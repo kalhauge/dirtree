@@ -1,3 +1,6 @@
 .stack-work
 *.cabal
 test/output/
+.ghc.environment.*
+test/zip-output
+dist-newstyle/*
