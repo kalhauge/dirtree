@@ -22,9 +22,9 @@ spec = do
   describe "reading a zipfile" $ do
     it "can read more.zip" $ do
       zipfile <- toArchive <$> BL.readFile "test/more.zip"
-      (zipfile ^. entries . to entriesToFileMap)
+      (zipfile ^. entries . to entriesToDirForest)
         `shouldBe` Just
-        ( fromFileList
+        ( DirForest . fromFileList $
           [ "data" ./
             [ "abslink" .*> External "/dev/null"
             , "deeplink" .*> Internal ["data","folder","deepfile"]
@@ -45,8 +45,8 @@ spec = do
            ) $ do
       it "can write more.zip" $ do
         zipfile <- toArchive <$> BL.readFile "test/more.zip"
-        let Just filemap = zipfile ^. entries . to entriesToFileMap
+        let Just forest = zipfile ^. entries . to entriesToDirForest
 
-        let bc = fromArchive $ zipfile & entries .~ entriesFromFileMap 0 filemap
+        let bc = fromArchive $ zipfile & entries .~ entriesFromDirForest 0 forest
         BL.writeFile "test/zip-output/more.zip" bc
-        toArchive bc ^. entries . to entriesToFileMap `shouldBe` Just filemap
+        toArchive bc ^. entries . to entriesToDirForest `shouldBe` Just forest

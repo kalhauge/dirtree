@@ -16,11 +16,11 @@ if more control is needed.
 
 module System.DirTree.Zip
   (
-    entriesToFileMap
-  , entriesFromFileMap
+    entriesToDirForest
+  , entriesFromDirForest
 
   -- * Helpers
-  , entryToFileMap
+  , entryToDirForest
   , entryFromFile
 
   , files
@@ -52,25 +52,24 @@ import qualified Data.ByteString.Lazy.Char8 as BLC
 
 
 -- | Convert a entry to a single filemap, fails if the entry path is empty.
-entryToFileMap ::
+entryToDirForest ::
   Entry
-  -> Maybe (FileMap (DirTree Entry))
-entryToFileMap e =
-  case fileKeyFromPath $ eRelativePath e of
-    k : rest -> Just $ singletonFileMap k (createDeepFile rest e)
-    [] -> Nothing
+  -> Maybe (DirForest Entry)
+entryToDirForest e =
+  flip createDeepForest (file e)
+  <$> toForestFileKey (fileKeyFromPath (eRelativePath e))
 
 -- | Convert entries to a 'FileMap' of 'RelativeDirTree'
-entriesToFileMap ::
+entriesToDirForest ::
   [Entry]
-  -> Maybe (FileMap (RelativeDirTree Link BL.ByteString))
-entriesToFileMap =
-  fmap (imap (\k -> imap $ parseEntry . (k:)) . fold)
-  . traverse entryToFileMap
+  -> Maybe (RelativeDirForest Link BL.ByteString)
+entriesToDirForest =
+  fmap (imap parseEntry . fold)
+  . traverse entryToDirForest
   where
     parseEntry key e =
       case symbolicLinkEntryTarget e of
-        Just f -> Symlink . toLink key $ f
+        Just f -> Symlink . toLink (fromForestFileKey key) $ f
         Nothing -> Real $ fromEntry e
 
 -- | Create a single entry from a file. This also handles symlinks, but changes
@@ -91,24 +90,24 @@ entryFromFile i key = \case
            }
 
 -- | Create a list of enties from a FileMap.
-entriesFromFileMap ::
+entriesFromDirForest ::
   Integer
-  -> FileMap (RelativeDirTree Link BL.ByteString)
+  -> RelativeDirForest Link BL.ByteString
   -> [Entry]
-entriesFromFileMap i =
-  concat . imap (\k -> map (uncurry $ entryFromFile i . (k:)) . itoList)
+entriesFromDirForest i =
+  toList . imap (\k -> entryFromFile i (fromForestFileKey k))
 
 -- | A simple lens into the entries of an archive.
 entries :: Lens' Archive [Entry]
 entries = lens zEntries (\a b -> a { zEntries = b })
 
 -- | A list of entries can be seen as a FileMap of
-entriesAsFileMap :: Integer -> Iso' [Entry] (FileMap (RelativeDirTree Link BL.ByteString))
-entriesAsFileMap i = iso from' to' where
-  from' = fromJust . entriesToFileMap
-  to'   = entriesFromFileMap i
+entriesAsDirForest :: Integer -> Iso' [Entry] (RelativeDirForest Link BL.ByteString)
+entriesAsDirForest i = iso from' to' where
+  from' = fromJust . entriesToDirForest
+  to'   = entriesFromDirForest i
 
 -- | A lens to get and set the files of an archive. Uses sparingly on
 -- big archvies as it will convert forth and back.
-files :: Lens' Archive (FileMap (RelativeDirTree Link BL.ByteString))
-files = entries . entriesAsFileMap 0
+files :: Lens' Archive (RelativeDirForest Link BL.ByteString)
+files = entries . entriesAsDirForest 0

@@ -72,12 +72,14 @@ module System.DirTree
  , emptyDirectory
 
  , createDeepFile
- , createDeepDirTree
+ , createDeepTree
 
    -- ** Accessors
  , FileKey
+
  , fileKeyFromPath
  , fileKeyToPath
+
  , diffFileKey
  , diffPath
 
@@ -104,6 +106,25 @@ module System.DirTree
  , followLinks
  , writeRelativeDirTree
 
+ -- * 'DirForest'
+ -- $DirForest
+
+ , DirForest (..)
+ , RelativeDirForest
+
+ , ForestFileKey
+ , fromForestFileKey
+ , toForestFileKey
+
+ -- ** Constructors
+ , asRelativeDirForest
+ , emptyForest
+ , singletonForest
+ , createDeepForest
+
+ -- ** Iterators
+ , alterForest
+
  ) where
 
 -- containers
@@ -128,7 +149,7 @@ import           Data.Functor
 import           Data.Foldable
 import           Data.Bifunctor
 import           Data.Maybe
-import           Data.List.NonEmpty (NonEmpty (..))
+import           Data.List.NonEmpty (NonEmpty (..), nonEmpty)
 import           Data.Semigroup (sconcat)
 import           Data.Monoid
 import           Data.Bitraversable
@@ -256,11 +277,11 @@ instance TraversableWithIndex String FileMap where
   itraverse f (FileMap fs) = FileMap <$> itraverse f fs
   {-# INLINE itraverse #-}
 
-instance Show a => Show (FileMap (DirTree a)) where
-  showsPrec d m = showParen (d > 9) $ showString "fromFileList " . showFileList m
+instance Show a => Show (DirForest a) where
+  showsPrec d m = showParen (d > 9) $ showString "DirForest . fromFileList " . showFileList m
     where
       showFileList =
-        showListWith (\(s, x) -> f s $ dirTreeNode x) . toFileList
+        showListWith (\(s, x) -> f s $ dirTreeNode x) . toFileList . getInternalFileMap
 
       f s (Directory x) =
         showsPrec (dir_prec+1) s .
@@ -319,7 +340,7 @@ instance At (FileMap a) where
 type FileKey = [String]
 
 -- | A 'DirTreeN' represents a single level in the DirTree.
-type DirTreeN a = DirTreeNode (FileMap (DirTree a)) a
+type DirTreeN a = DirTreeNode (DirForest a) a
 
 -- | A specialized traversal of the DirTreeNode
 itraverseDirTreeN ::
@@ -329,7 +350,7 @@ itraverseDirTreeN ::
   -> f (DirTreeN b)
 itraverseDirTreeN fia = \case
   Directory m ->
-    Directory <$> itraverse (\st -> itraverse (fia . (st:))) m
+    Directory <$> itraverse (fia . fromForestFileKey) m
   File a ->
     File <$> fia [] a
 
@@ -341,16 +362,14 @@ newtype DirTree a = DirTree
   deriving (Eq, Ord, NFData, Generic)
 
 
-makeWrapped ''DirTree
-
 instance Functor DirTree where
-  fmap f (DirTree a) = DirTree $ bimap (fmap (fmap f)) f a
+  fmap f (DirTree a) = DirTree $ bimap (fmap f) f a
 
 instance Foldable DirTree where
-  foldMap f (DirTree e) = bifoldMap (foldMap (foldMap f)) f e
+  foldMap f (DirTree e) = bifoldMap (foldMap f) f e
 
 instance Traversable DirTree where
-  traverse f (DirTree e) = DirTree <$> bitraverse (traverse (traverse f)) f e
+  traverse f (DirTree e) = DirTree <$> bitraverse (traverse f) f e
 
 instance FunctorWithIndex FileKey DirTree
 instance FoldableWithIndex FileKey DirTree
@@ -365,9 +384,6 @@ type RelativeDirTree s a = DirTree (RelativeFile s a)
 asRelativeDirTree :: DirTree a -> RelativeDirTree s a
 asRelativeDirTree = fmap Real
 
-instance AsDirTreeNode (DirTree a) (FileMap (DirTree a)) a where
-  _DirTreeNode = _Wrapped
-  {-# INLINE _DirTreeNode #-}
 
 instance (Show a) => Show (DirTree a) where
   showsPrec d c = showParen (d >9) (f $ dirTreeNode c)
@@ -407,13 +423,13 @@ symlink = file . Symlink
 {-# INLINE symlink #-}
 
 -- | Constructs a dirtree with a directory
-directory :: FileMap (DirTree a) -> DirTree a
+directory :: DirForest a -> DirTree a
 directory = DirTree . Directory
 {-# INLINE directory #-}
 
 -- | Constructs a dirtree with a file list
 directory' :: [(String, DirTree a)] -> DirTree a
-directory' = DirTree . Directory . fromFileList
+directory' = DirTree . Directory . DirForest . fromFileList
 {-# INLINE directory' #-}
 
 -- | Constructs a dirtree with a empty directory
@@ -516,24 +532,24 @@ alterFile fn key = maybe (newFile key) (go key) where
       [] -> fn (Just tree)
       k : rest ->
         case node of
-          Directory a -> Just . directory <$> alterFileMap (alterFile fn rest) k a
+          Directory a -> Just . directory <$> alterForest fn (k :| rest) a
           File _ -> newFile rest
 
   newFile :: FileKey -> f (Maybe (DirTree a))
-  newFile key' = fmap (createDeepDirTree key') <$> fn Nothing
+  newFile key' = fmap (createDeepTree key') <$> fn Nothing
 {-# INLINE alterFile #-}
 
 -- | Create a recursive `DirTree` from a FileKey and a value.
 createDeepFile :: FileKey -> a -> DirTree a
 createDeepFile key a =
-  createDeepDirTree key (file a)
+  createDeepTree key (file a)
 {-# INLINE createDeepFile #-}
 
 -- | Create a recursive `DirTree` from a FileKey and a value.
-createDeepDirTree :: FileKey -> DirTree a -> DirTree a
-createDeepDirTree key a =
-  foldr (\s f -> directory (singletonFileMap s f)) a key
-{-# INLINE createDeepDirTree #-}
+createDeepTree :: FileKey -> DirTree a -> DirTree a
+createDeepTree key a =
+  foldr (\s f -> directory (singletonForest s f)) a key
+{-# INLINE createDeepTree #-}
 
 type instance Index (DirTree a) = FileKey
 type instance IxValue (DirTree a) = DirTree a
@@ -541,11 +557,11 @@ type instance IxValue (DirTree a) = DirTree a
 instance Ixed (DirTree a) where
   ix key fn = go key where
     go key' tree@(DirTree node) =
-      case key' of
-        [] -> fn tree
-        k : rest ->
+      case nonEmpty key' of
+        Nothing -> fn tree
+        Just fk ->
           case node of
-            Directory a -> directory <$> ix k (ix rest fn) a
+            Directory a -> directory <$> ix fk fn a
             File _ -> pure tree
   {-# INLINE ix #-}
 
@@ -566,7 +582,7 @@ iflattenDirTree ::
   -> m
 iflattenDirTree f = go id where
   go fk =
-    f (fk []) . first (imap $ \k -> go (fk . (k:))) . dirTreeNode
+    f (fk []) . first (imap (\k -> go (fk . (k:))) . getInternalFileMap) . dirTreeNode
 {-# inline iflattenDirTree #-}
 
 -- | This method enables eta reduction of a DirTree a.
@@ -575,7 +591,7 @@ flattenDirTree ::
   -> DirTree a
   -> m
 flattenDirTree f = go where
-  go = f . first (fmap go) . dirTreeNode
+  go = f . first (fmap go . getInternalFileMap) . dirTreeNode
 {-# inline flattenDirTree #-}
 
 -- | Uses a semigroup to join together the results, This is slightly
@@ -587,7 +603,8 @@ depthfirst ::
   -> DirTree a
   -> m
 depthfirst f = iflattenDirTree $ \k -> \case
-  Directory fm -> sconcat $ f k (Directory $ toFileNames fm) :| toList fm
+  Directory fm -> sconcat $
+    f k (Directory . toFileNames $ fm) :| Data.Foldable.toList fm
   File a -> f k (File a)
 {-# inline depthfirst #-}
 
@@ -634,7 +651,7 @@ readRelativeDirTree reader' fp = do
     go from' fp' = do
       node <- readPath fp'
       DirTree <$> bimapM
-        ( fmap fromFileList . mapM (\k -> (k,) <$> go from' (fp' </> k)) )
+        ( fmap (DirForest . fromFileList) . mapM (\k -> (k,) <$> go from' (fp' </> k)) )
         ( bimapM absolute (const $ reader' fp') )
         node
       where
@@ -675,7 +692,7 @@ followLinks fn tree = go tree where
       return $ file a
 
     Directory a ->
-      directory <$> sequence a
+      directory . DirForest <$> sequence a
 
 -- | Writes a Relative DirTree to a file
 writeRelativeDirTree ::
@@ -712,3 +729,102 @@ writeDirTree ::
 writeDirTree writer fp = writeRelativeDirTree writer fp . asRelativeDirTree
 {-# INLINE writeDirTree #-}
 
+
+-- $DirForest
+-- A 'DirForest' is the content of a directory. A 'DirForest' is more
+-- useful in some cases
+
+newtype DirForest a = DirForest
+  { getInternalFileMap :: FileMap (DirTree a)
+  } deriving (Eq, Ord, NFData, Generic)
+
+instance Functor DirForest where
+  fmap f (DirForest a) = DirForest $ fmap (fmap f) a
+
+instance Foldable DirForest where
+  foldMap f (DirForest e) = foldMap (foldMap f) e
+
+instance Traversable DirForest where
+  traverse f (DirForest e) = DirForest <$> traverse (traverse f) e
+
+instance FunctorWithIndex ForestFileKey DirForest
+instance FoldableWithIndex ForestFileKey DirForest
+instance TraversableWithIndex ForestFileKey DirForest where
+  itraverse f (DirForest fs) =
+    DirForest <$> itraverse (\k -> itraverse (f . (k:|))) fs
+  {-# INLINE itraverse #-}
+
+instance Semigroup (DirForest a) where
+  (DirForest a) <> (DirForest b) = DirForest (a <> b)
+
+instance Monoid (DirForest a) where
+  mempty = DirForest mempty
+
+-- | All entries in a DirForest has to be non-empty
+type ForestFileKey = NonEmpty String
+
+-- | Convert a 'ForestFileKey' to a 'FileKey'
+fromForestFileKey :: ForestFileKey -> FileKey
+fromForestFileKey = toList
+
+-- | Convert a 'FileKey' to a 'ForestFileKey'
+toForestFileKey :: FileKey -> Maybe ForestFileKey
+toForestFileKey = nonEmpty
+
+-- | Creates an 'emptyForest'
+emptyForest :: DirForest a
+emptyForest = mempty
+
+-- | Creates an 'emptyForest'
+singletonForest :: String -> DirTree a -> DirForest a
+singletonForest k f =
+  DirForest $ singletonFileMap k f
+
+-- | Creates an 'deepForest'
+createDeepForest :: ForestFileKey -> DirTree a -> DirForest a
+createDeepForest (k :| rest) f =
+  singletonForest k (createDeepTree rest f)
+
+-- | A relative dir forest also exists.
+type RelativeDirForest s a = DirForest (RelativeFile s a)
+
+-- | All 'DirTree's are also relative.
+asRelativeDirForest :: DirForest a -> RelativeDirForest s a
+asRelativeDirForest = fmap Real
+
+type instance Index (DirForest a) = ForestFileKey
+type instance IxValue (DirForest a) = DirTree a
+
+instance Ixed (DirForest a) where
+  ix (k :| key) fn a = DirForest <$> ix k (ix key fn) (getInternalFileMap a)
+  --   -- ix key fn . getInternalFileMap
+  --   go key' tree@(DirTree node) =
+  --     case key' of
+  --       [] -> fn tree
+  --       k : rest ->
+  --         case node of
+  --           Directory a -> directory <$> ix k (ix rest fn) a
+  --           File _ -> pure tree
+  {-# INLINE ix #-}
+
+alterForest ::
+  forall f a. Functor f
+  => (Maybe (DirTree a) -> f (Maybe (DirTree a)))
+  -> ForestFileKey
+  -> DirForest a
+  -> f (DirForest a)
+alterForest fn (k :| key) a =
+  DirForest <$> alterFileMap (alterFile fn key) k (getInternalFileMap a)
+
+-- >>> emptyDirForest & at ("file" :| ["path"]) ?~ file 'x'
+-- fromFileList ["file" ./ ["path" .* 'x']]
+instance At (DirForest a) where
+  at k f = alterForest f k
+  {-# INLINE at #-}
+
+makeWrapped ''DirTree
+makeWrapped ''DirForest
+
+instance AsDirTreeNode (DirTree a) (DirForest a) a where
+  _DirTreeNode = _Wrapped
+  {-# INLINE _DirTreeNode #-}

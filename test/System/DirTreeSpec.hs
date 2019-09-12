@@ -167,10 +167,10 @@ spec = do
         directory' [ "a" .* "y"]
 
     it "can join FileMaps together" $ do
-      fromFileList ["a" .* "x"]
-        <> fromFileList [ "b" .* "x" ]
+      (DirForest . fromFileList) ["a" .* "x"]
+        <> (DirForest . fromFileList) [ "b" .* "x" ]
         `shouldBe`
-        fromFileList
+        (DirForest . fromFileList)
          [ "a" .* "x"
          , "b" .* "x"
          ]
