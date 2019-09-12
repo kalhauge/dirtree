@@ -43,7 +43,7 @@ module System.DirTree
    -- * 'FileMap'
    -- $FileMap
 
- , FileMap
+ , FileMap (..)
 
  -- ** Constructors
  , emptyFileMap
@@ -57,7 +57,7 @@ module System.DirTree
 
    -- * 'DirTree'
    -- $DirTree
- , DirTree
+ , DirTree (..)
  , RelativeDirTree
  , asRelativeDirTree
 
@@ -357,7 +357,7 @@ itraverseDirTreeN fia = \case
 
 -- | A dir tree is a tree of nodes.
 newtype DirTree a = DirTree
-  { dirTreeNode :: DirTreeN a
+  { dirTreeNode :: DirTreeNode (DirForest a) a
   }
   deriving (Eq, Ord, NFData, Generic)
 
@@ -771,16 +771,16 @@ fromForestFileKey = toList
 toForestFileKey :: FileKey -> Maybe ForestFileKey
 toForestFileKey = nonEmpty
 
--- | Creates an 'emptyForest'
+-- | Creates an empty forest
 emptyForest :: DirForest a
 emptyForest = mempty
 
--- | Creates an 'emptyForest'
+-- | Creates an singleton forest
 singletonForest :: String -> DirTree a -> DirForest a
 singletonForest k f =
   DirForest $ singletonFileMap k f
 
--- | Creates an 'deepForest'
+-- | Creates an deep file in a forest
 createDeepForest :: ForestFileKey -> DirTree a -> DirForest a
 createDeepForest (k :| rest) f =
   singletonForest k (createDeepTree rest f)
