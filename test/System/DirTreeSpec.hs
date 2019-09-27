@@ -12,6 +12,10 @@ import System.IO.Error
 
 spec :: Spec
 spec = do
+  possibleSpec
+
+possibleSpec :: Spec
+possibleSpec = do 
   describe "getFileType" $ do
     it "should find a directory" $ do
       getFileType "test/data" `shouldReturn` Directory ()

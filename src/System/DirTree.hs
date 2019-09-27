@@ -223,6 +223,7 @@ fileTypeOfNode = bimap (const ()) (bimap (const ()) (const ()))
 -- | Check a filepath for Type, throws an IOException if path does not exist.
 getFileType :: FilePath -> IO FileType
 getFileType fp =
+  -- TODO: Throw a resonable exception if the file does not exist.
   pathIsSymbolicLink fp >>= \case
   True ->
     return $ File (Symlink ())
