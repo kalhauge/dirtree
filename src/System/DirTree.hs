@@ -38,6 +38,7 @@ module System.DirTree
 
    -- ** IO
  , getFileType
+ , checkFileType
  , readPath
 
    -- * 'FileMap'
@@ -154,6 +155,7 @@ import           Data.Semigroup (sconcat)
 import           Data.Monoid
 import           Data.Bitraversable
 import           Data.Bifoldable
+import           System.IO.Error
 import           Control.Monad
 import           Text.Show
 import           GHC.Generics
@@ -233,6 +235,12 @@ getFileType fp =
       return $ Directory ()
     False ->
       return $ File (Real ())
+
+-- | Check a filepath for Type, return Nothing if the path does not
+-- exist.
+checkFileType :: FilePath -> IO (Maybe FileType)
+checkFileType fp =
+  catchIOError (Just <$> getFileType fp) (const . return $ Nothing)
 
 -- | Reads the structure of the filepath
 readPath ::

@@ -4,3 +4,6 @@ test/output/
 .ghc.environment.*
 test/zip-output
 dist-newstyle/*
+
+failures.txt
+result
