@@ -15,14 +15,12 @@ if more control is needed.
 -}
 
 module System.DirTree.Zip
-  (
-    entriesToDirForest
+  ( entriesToDirForest
   , entriesFromDirForest
 
   -- * Helpers
   , entryToDirForest
   , entryFromFile
-
   , files
   , entries
     -- * Re-Exports
@@ -31,78 +29,72 @@ module System.DirTree.Zip
   )
 where
 
+
 -- base
-import Data.Foldable
-import Data.Maybe
-import Data.Bits
-import System.Posix.Files (symbolicLinkMode, stdFileMode)
+import           Data.Foldable
+import           Data.Maybe
+import           Data.Bits
+import           System.Posix.Files             ( symbolicLinkMode
+                                                , stdFileMode
+                                                )
 
 -- lens
-import Control.Lens
+import           Control.Lens
 
 -- zip-archive
-import Codec.Archive.Zip
+import           Codec.Archive.Zip
 
 -- dirtree
-import System.DirTree
+import           System.DirTree
 
 -- bytestring
-import qualified Data.ByteString.Lazy as BL
-import qualified Data.ByteString.Lazy.Char8 as BLC
+import qualified Data.ByteString.Lazy          as BL
+import qualified Data.ByteString.Lazy.Char8    as BLC
 
 
 -- | Convert a entry to a single filemap, fails if the entry path is empty.
-entryToDirForest ::
-  Entry
-  -> Maybe (DirForest Entry)
-entryToDirForest e =
-  flip createDeepForest (file e)
+entryToDirForest :: Entry -> Maybe (DirForest Entry)
+entryToDirForest e = flip createDeepForest (file e)
   <$> toForestFileKey (fileKeyFromPath (eRelativePath e))
 
 -- | Convert entries to a 'FileMap' of 'RelativeDirTree'
-entriesToDirForest ::
-  [Entry]
-  -> Maybe (RelativeDirForest Link BL.ByteString)
-entriesToDirForest =
-  fmap (imap parseEntry . fold)
-  . traverse entryToDirForest
-  where
-    parseEntry key e =
-      case symbolicLinkEntryTarget e of
-        Just f -> Symlink . toLink (fromForestFileKey key) $ f
-        Nothing -> Real $ fromEntry e
+entriesToDirForest :: [Entry] -> Maybe (RelativeDirForest Link BL.ByteString)
+entriesToDirForest = fmap (imap parseEntry . fold) . traverse entryToDirForest
+ where
+  parseEntry key e = case symbolicLinkEntryTarget e of
+    Just f  -> Symlink . toLink (fromForestFileKey key) $ f
+    Nothing -> Real $ fromEntry e
 
 -- | Create a single entry from a file. This also handles symlinks, but changes
 -- saves all files with the 'stdFileMode'.
 entryFromFile :: Integer -> FileKey -> RelativeFile Link BL.ByteString -> Entry
 entryFromFile i key = \case
-  Real bs -> toEntry (fileKeyToPath key) i bs
-  Symlink x ->
-    toSymlinkEntry (fileKeyToPath key) $ case x of
-      Internal trgt -> diffFileKey (init key) trgt
-      External f -> f
-  where
-    toSymlinkEntry path t =
-      let e = toEntry path i (BLC.pack t)
-      in e { eExternalFileAttributes =
-             eExternalFileAttributes e .|. shiftL (fromIntegral ( symbolicLinkMode .|. stdFileMode)) 16
-           , eVersionMadeBy = 798 -- Random high number
-           }
+  Real    bs -> toEntry (fileKeyToPath key) i bs
+  Symlink x  -> toSymlinkEntry (fileKeyToPath key) $ case x of
+    Internal trgt -> diffFileKey (init key) trgt
+    External f    -> f
+ where
+  toSymlinkEntry path t =
+    let e           = toEntry path i (BLC.pack t)
+        shiftlength = fromIntegral (symbolicLinkMode .|. stdFileMode)
+    in  e
+          { eExternalFileAttributes = eExternalFileAttributes e
+                                        .|. shiftL shiftlength 16
+          , eVersionMadeBy          = 798 -- Random high number
+          }
 
 -- | Create a list of enties from a FileMap.
-entriesFromDirForest ::
-  Integer
-  -> RelativeDirForest Link BL.ByteString
-  -> [Entry]
-entriesFromDirForest i =
-  toList . imap (\k -> entryFromFile i (fromForestFileKey k))
+entriesFromDirForest
+  :: Integer -> RelativeDirForest Link BL.ByteString -> [Entry]
+entriesFromDirForest i = toList . imap (entryFromFile i . fromForestFileKey)
 
 -- | A simple lens into the entries of an archive.
 entries :: Lens' Archive [Entry]
 entries = lens zEntries (\a b -> a { zEntries = b })
 
 -- | A list of entries can be seen as a FileMap of
-entriesAsDirForest :: Integer -> Iso' [Entry] (RelativeDirForest Link BL.ByteString)
+entriesAsDirForest
+  :: Integer -> Iso' [Entry] (RelativeDirForest Link BL.ByteString)
 entriesAsDirForest i = iso from' to' where
   from' = fromJust . entriesToDirForest
   to'   = entriesFromDirForest i
