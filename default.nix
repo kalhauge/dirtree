@@ -1,23 +1,15 @@
-{ mkDerivation, base, bytestring, containers, deepseq, directory
-, filepath, hpack, hspec, hspec-discover
-, hspec-expectations-pretty-diff, lens, stdenv, unix, zip-archive
+{ pkgs ? import (builtins.fetchTarball "https://github.com/nixos/nixpkgs/archive/24c765c744b.tar.gz") {}
+, compiler ? "default"
 }:
-mkDerivation {
-  pname = "dirtree";
-  version = "0.1.1";
-  src = ./.;
-  libraryHaskellDepends = [
-    base bytestring containers deepseq directory filepath lens unix
-    zip-archive
-  ];
-  libraryToolDepends = [ hpack ];
-  testHaskellDepends = [
-    base bytestring containers deepseq directory filepath hspec
-    hspec-discover hspec-expectations-pretty-diff lens unix zip-archive
-  ];
-  testToolDepends = [ hspec-discover ];
-  preConfigure = "hpack";
-  homepage = "https://github.com/kalhauge/dirtree#readme";
-  description = "A small library for working with directories";
-  license = stdenv.lib.licenses.mit;
+let 
+  inherit (import (builtins.fetchTarball "https://github.com/hercules-ci/gitignore/archive/7415c4f.tar.gz") { }) gitignoreSource; 
+  hpkgs = if compiler == "default" then pkgs.haskellPackages else pkgs.haskell.packages."${compiler}";
+in 
+hpkgs.developPackage { 
+  root = gitignoreSource ./.;
+  name = "dirtree";
+  modifier = drv: 
+  with pkgs.haskell.lib; 
+    addBuildTools drv (with hpkgs; [ cabal-install ghcid ])
+  ;
 }
