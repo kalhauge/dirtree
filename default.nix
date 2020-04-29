@@ -8,7 +8,10 @@ let
     else pkgs.haskell.packages."${compiler}";
 in
   haskellPackages.developPackage {
-    root = ./.;
+    root = pkgs.lib.cleanSourceWith 
+      { filter = path: type: baseNameOf path != ".nix";
+        src = pkgs.lib.cleanSource ./.;
+      };
     name = "dirtree";
     source-overrides = {};
     modifier = drv:
